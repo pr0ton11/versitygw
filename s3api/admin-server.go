@@ -40,6 +40,8 @@ type S3AdminServer struct {
 	corsAllowOrigin string
 	maxConnections  int
 	maxRequests     int
+	proxyHeader     string
+	trustedProxies  []string
 }
 
 func NewAdminServer(be backend.Backend, root middlewares.RootUserConfig, region string, iam auth.IAMService, l s3log.AuditLogger, ctrl controllers.S3ApiController, opts ...AdminOpt) *S3AdminServer {
@@ -55,12 +57,15 @@ func NewAdminServer(be backend.Backend, root middlewares.RootUserConfig, region 
 	}
 
 	app := fiber.New(fiber.Config{
-		AppName:               "versitygw",
-		ServerHeader:          "VERSITYGW",
-		Network:               fiber.NetworkTCP,
-		DisableStartupMessage: true,
-		ErrorHandler:          globalErrorHandler,
-		Concurrency:           server.maxConnections,
+		AppName:                 "versitygw",
+		ServerHeader:            "VERSITYGW",
+		Network:                 fiber.NetworkTCP,
+		DisableStartupMessage:   true,
+		ErrorHandler:            globalErrorHandler,
+		Concurrency:             server.maxConnections,
+		ProxyHeader:             server.proxyHeader,
+		EnableTrustedProxyCheck: len(server.trustedProxies) > 0,
+		TrustedProxies:          server.trustedProxies,
 	})
 
 	server.app = app
@@ -122,6 +127,18 @@ func WithAdminConcurrencyLimiter(maxConnections, maxRequests int) AdminOpt {
 		s.maxConnections = maxConnections
 		s.maxRequests = maxRequests
 	}
+}
+
+// WithAdminProxyHeader sets the HTTP header name to read the real client IP
+// from when the admin server is behind a reverse proxy.
+func WithAdminProxyHeader(header string) AdminOpt {
+	return func(s *S3AdminServer) { s.proxyHeader = header }
+}
+
+// WithAdminTrustedProxies restricts which source addresses are allowed to set
+// the proxy header on the admin server.
+func WithAdminTrustedProxies(proxies []string) AdminOpt {
+	return func(s *S3AdminServer) { s.trustedProxies = proxies }
 }
 
 // ServeMultiPort creates listeners for multiple port specifications and serves

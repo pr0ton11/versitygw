@@ -108,6 +108,8 @@ var (
 	websiteCertFile, websiteKeyFile        string
 	websiteNoTLS                           bool
 	disableACLs                            bool
+	proxyHeader                            string
+	trustedProxies                         string
 	mpMaxParts                             int
 	copyObjectThreshold                    int64
 )
@@ -395,6 +397,18 @@ func initFlags() []cli.Flag {
 			Usage:       "enable keep-alive connections (for finnicky clients)",
 			EnvVars:     []string{"VGW_KEEP_ALIVE"},
 			Destination: &keepAlive,
+		},
+		&cli.StringFlag{
+			Name:        "proxy-header",
+			Usage:       "HTTP header to read the real client IP from when behind a reverse proxy (e.g. 'X-Forwarded-For', 'X-Real-Ip'); when empty, the TCP remote address is used",
+			EnvVars:     []string{"VGW_PROXY_HEADER"},
+			Destination: &proxyHeader,
+		},
+		&cli.StringFlag{
+			Name:        "trusted-proxies",
+			Usage:       "comma-separated list of trusted reverse proxy IPs or CIDRs (e.g. '127.0.0.1,::1,10.0.0.0/8'); when set, --proxy-header is only honoured for requests from these addresses; when empty and --proxy-header is set, all sources are trusted",
+			EnvVars:     []string{"VGW_TRUSTED_PROXIES"},
+			Destination: &trustedProxies,
 		},
 		&cli.BoolFlag{
 			Name:        "quiet",
@@ -941,6 +955,12 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 	if keepAlive {
 		opts = append(opts, s3api.WithKeepAlive())
 	}
+	if proxyHeader != "" {
+		opts = append(opts, s3api.WithProxyHeader(proxyHeader))
+		if trustedProxies != "" {
+			opts = append(opts, s3api.WithTrustedProxies(strings.Split(trustedProxies, ",")))
+		}
+	}
 	if disableACLs {
 		opts = append(opts, s3api.WithDisableACL())
 	}
@@ -1140,6 +1160,12 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 		if debug {
 			opts = append(opts, s3api.WithAdminDebug())
 		}
+		if proxyHeader != "" {
+			opts = append(opts, s3api.WithAdminProxyHeader(proxyHeader))
+			if trustedProxies != "" {
+				opts = append(opts, s3api.WithAdminTrustedProxies(strings.Split(trustedProxies, ",")))
+			}
+		}
 
 		admSrv = s3api.NewAdminServer(be, middlewares.RootUserConfig{Access: rootUserAccess, Secret: rootUserSecret}, region, iam, loggers.AdminLogger, srv.Router.Ctrl, opts...)
 	}
@@ -1252,6 +1278,12 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 		if webuiPathPrefix != "" {
 			webOpts = append(webOpts, webui.WithPathPrefix(webuiPathPrefix))
 		}
+		if proxyHeader != "" {
+			webOpts = append(webOpts, webui.WithProxyHeader(proxyHeader))
+			if trustedProxies != "" {
+				webOpts = append(webOpts, webui.WithTrustedProxies(strings.Split(trustedProxies, ",")))
+			}
+		}
 
 		webSrv = webui.NewServer(&webui.ServerConfig{
 			Gateways:      gateways,
@@ -1312,6 +1344,12 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 
 		if quiet {
 			wsOpts = append(wsOpts, website.WithQuiet())
+		}
+		if proxyHeader != "" {
+			wsOpts = append(wsOpts, website.WithProxyHeader(proxyHeader))
+			if trustedProxies != "" {
+				wsOpts = append(wsOpts, website.WithTrustedProxies(strings.Split(trustedProxies, ",")))
+			}
 		}
 
 		wsSrv = website.NewServer(be, websiteDomain, wsOpts...)

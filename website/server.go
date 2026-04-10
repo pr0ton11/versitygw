@@ -27,10 +27,12 @@ import (
 
 // Server is the static website hosting endpoint.
 type Server struct {
-	app         *fiber.App
-	CertStorage *utils.CertStorage
-	domain      string
-	quiet       bool
+	app            *fiber.App
+	CertStorage    *utils.CertStorage
+	domain         string
+	quiet          bool
+	proxyHeader    string
+	trustedProxies []string
 }
 
 // Option sets various options for NewServer().
@@ -46,26 +48,42 @@ func WithTLS(cs *utils.CertStorage) Option {
 	return func(s *Server) { s.CertStorage = cs }
 }
 
+// WithProxyHeader sets the HTTP header name to read the real client IP from
+// when the website server is behind a reverse proxy.
+func WithProxyHeader(header string) Option {
+	return func(s *Server) { s.proxyHeader = header }
+}
+
+// WithTrustedProxies restricts which source addresses are allowed to set the
+// proxy header on the website server.
+func WithTrustedProxies(proxies []string) Option {
+	return func(s *Server) { s.trustedProxies = proxies }
+}
+
 // NewServer creates a new static website hosting server.
 // The domain parameter is the base domain for virtual-host routing:
 //   - Host "blog.<domain>" resolves to bucket "blog"
 //   - Host "<domain>" (apex, no subdomain) resolves to bucket "<domain>"
 func NewServer(be backend.Backend, domain string, opts ...Option) *Server {
-	app := fiber.New(fiber.Config{
-		AppName:               "versitygw-website",
-		ServerHeader:          "VERSITYGW",
-		DisableStartupMessage: true,
-		Network:               fiber.NetworkTCP,
-	})
-
 	server := &Server{
-		app:    app,
 		domain: domain,
 	}
 
 	for _, opt := range opts {
 		opt(server)
 	}
+
+	app := fiber.New(fiber.Config{
+		AppName:                 "versitygw-website",
+		ServerHeader:            "VERSITYGW",
+		DisableStartupMessage:   true,
+		Network:                 fiber.NetworkTCP,
+		ProxyHeader:             server.proxyHeader,
+		EnableTrustedProxyCheck: len(server.trustedProxies) > 0,
+		TrustedProxies:          server.trustedProxies,
+	})
+
+	server.app = app
 
 	domainInfo := "catch-all"
 	if domain != "" {

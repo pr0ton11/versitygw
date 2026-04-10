@@ -38,11 +38,13 @@ type ServerConfig struct {
 
 // Server is the main GUI server
 type Server struct {
-	app         *fiber.App
-	CertStorage *utils.CertStorage
-	config      *ServerConfig
-	pathPrefix  string
-	quiet       bool
+	app            *fiber.App
+	CertStorage    *utils.CertStorage
+	config         *ServerConfig
+	pathPrefix     string
+	quiet          bool
+	proxyHeader    string
+	trustedProxies []string
 }
 
 // Option sets various options for NewServer()
@@ -63,23 +65,39 @@ func WithPathPrefix(prefix string) Option {
 	return func(s *Server) { s.pathPrefix = prefix }
 }
 
+// WithProxyHeader sets the HTTP header name to read the real client IP from
+// when the WebUI server is behind a reverse proxy.
+func WithProxyHeader(header string) Option {
+	return func(s *Server) { s.proxyHeader = header }
+}
+
+// WithTrustedProxies restricts which source addresses are allowed to set the
+// proxy header on the WebUI server.
+func WithTrustedProxies(proxies []string) Option {
+	return func(s *Server) { s.trustedProxies = proxies }
+}
+
 // NewServer creates a new GUI server instance
 func NewServer(cfg *ServerConfig, opts ...Option) *Server {
-	app := fiber.New(fiber.Config{
-		AppName:               "versitygw",
-		ServerHeader:          "VERSITYGW",
-		DisableStartupMessage: true,
-		Network:               fiber.NetworkTCP,
-	})
-
 	server := &Server{
-		app:    app,
 		config: cfg,
 	}
 
 	for _, opt := range opts {
 		opt(server)
 	}
+
+	app := fiber.New(fiber.Config{
+		AppName:                 "versitygw",
+		ServerHeader:            "VERSITYGW",
+		DisableStartupMessage:   true,
+		Network:                 fiber.NetworkTCP,
+		ProxyHeader:             server.proxyHeader,
+		EnableTrustedProxyCheck: len(server.trustedProxies) > 0,
+		TrustedProxies:          server.trustedProxies,
+	})
+
+	server.app = app
 
 	fmt.Printf("initializing web dashboard\n")
 

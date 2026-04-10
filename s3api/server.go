@@ -54,6 +54,8 @@ type S3ApiServer struct {
 	maxRequests      int
 	webuiMountPrefix string
 	webuiSrvCfg      *webui.ServerConfig
+	proxyHeader      string
+	trustedProxies   []string
 }
 
 func New(
@@ -86,14 +88,17 @@ func New(
 	}
 
 	app := fiber.New(fiber.Config{
-		AppName:               "versitygw",
-		ServerHeader:          "VERSITYGW",
-		StreamRequestBody:     true,
-		DisableKeepalive:      !server.keepAlive,
-		Network:               fiber.NetworkTCP,
-		DisableStartupMessage: true,
-		ErrorHandler:          globalErrorHandler,
-		Concurrency:           server.maxConnections,
+		AppName:                 "versitygw",
+		ServerHeader:            "VERSITYGW",
+		StreamRequestBody:       true,
+		DisableKeepalive:        !server.keepAlive,
+		Network:                 fiber.NetworkTCP,
+		DisableStartupMessage:   true,
+		ErrorHandler:            globalErrorHandler,
+		Concurrency:             server.maxConnections,
+		ProxyHeader:             server.proxyHeader,
+		EnableTrustedProxyCheck: len(server.trustedProxies) > 0,
+		TrustedProxies:          server.trustedProxies,
 		// Sets buffer limit to read/parse incoming requests
 		// if the limit is reached, fiber/fasthttp will throw an error
 		// in the global error handler
@@ -190,6 +195,18 @@ func WithHostStyle(virtualDomain string) Option {
 // WithKeepAlive enables the server keep alive
 func WithKeepAlive() Option {
 	return func(s *S3ApiServer) { s.keepAlive = true }
+}
+
+// WithProxyHeader sets the HTTP header name to read the real client IP from
+// when the gateway is behind a reverse proxy (e.g. "X-Forwarded-For").
+func WithProxyHeader(header string) Option {
+	return func(s *S3ApiServer) { s.proxyHeader = header }
+}
+
+// WithTrustedProxies restricts which source addresses are allowed to set the
+// proxy header. When non-empty, EnableTrustedProxyCheck is turned on.
+func WithTrustedProxies(proxies []string) Option {
+	return func(s *S3ApiServer) { s.trustedProxies = proxies }
 }
 
 // WithCORSAllowOrigin sets the default CORS Access-Control-Allow-Origin value.
