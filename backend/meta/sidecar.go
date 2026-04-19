@@ -80,11 +80,17 @@ func (s SideCar) StoreAttribute(_ *os.File, bucket, object, attribute string, va
 		return fmt.Errorf("failed to create temporary file: %v", err)
 	}
 	defer os.Remove(tempfile.Name())
-	defer tempfile.Close()
 
 	_, err = tempfile.Write(value)
 	if err != nil {
+		tempfile.Close()
 		return fmt.Errorf("failed to write attribute: %v", err)
+	}
+
+	// Close explicitly before rename to prevent error on Windows:
+	// The process cannot access the file because it is being used by another process.
+	if err = tempfile.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary file: %v", err)
 	}
 
 	err = os.Rename(tempfile.Name(), attr)
@@ -151,6 +157,25 @@ func (s SideCar) DeleteAttributes(bucket, object string) error {
 	}
 	s.cleanupEmptyDirs(metadir, bucket, object)
 	return nil
+}
+
+// RenameObject renames the sidecar metadata directory from oldObject to
+// newObject so that path-based lookups continue to work after the data
+// directory has been renamed.
+func (s SideCar) RenameObject(bucket, oldObject, newObject string) error {
+	oldPath := filepath.Join(s.dir, bucket, oldObject)
+	newPath := filepath.Join(s.dir, bucket, newObject)
+
+	if err := os.MkdirAll(filepath.Dir(newPath), 0777); err != nil {
+		return fmt.Errorf("create parent for renamed metadata: %w", err)
+	}
+
+	err := os.Rename(oldPath, newPath)
+	if errors.Is(err, os.ErrNotExist) {
+		// No metadata stored yet — nothing to rename.
+		return nil
+	}
+	return err
 }
 
 func (s SideCar) cleanupEmptyDirs(metadir, bucket, object string) {

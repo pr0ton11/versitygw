@@ -33,7 +33,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/gofiber/fiber/v2"
-	"github.com/oklog/ulid/v2"
 	"github.com/valyala/fasthttp"
 	"github.com/versity/versitygw/debuglogger"
 	"github.com/versity/versitygw/s3err"
@@ -967,7 +966,7 @@ func ConvertToStringPtr[T any](val T) *string {
 	return &str
 }
 
-// Converst any pointer to a string pointer
+// Converts any pointer to a string pointer
 func ConvertPtrToStringPtr[T any](val *T) *string {
 	if val == nil {
 		return nil
@@ -1015,7 +1014,7 @@ func ValidateCopySource(copysource string) error {
 
 	// cut till the versionId as it's the only query param
 	// that is recognized in copy source
-	object, versionId, _ := strings.Cut(rest, "?versionId=")
+	object, _, _ := strings.Cut(rest, "?versionId=")
 
 	// objects containing '../', '...../' ... are considered valid in AWS
 	// but for the security purposes these should be considered as invalid
@@ -1023,12 +1022,6 @@ func ValidateCopySource(copysource string) error {
 	if !IsObjectNameValid(object) {
 		debuglogger.Logf("invalid copy source object: %s", object)
 		return s3err.GetAPIError(s3err.ErrInvalidCopySourceObject)
-	}
-
-	// validate the versionId
-	err = ValidateVersionId(versionId)
-	if err != nil {
-		return err
 	}
 
 	return nil
@@ -1049,20 +1042,6 @@ func ApplyOverride(original, override *string) *string {
 		return override
 	}
 	return original
-}
-
-// ValidateVersionId check if the input versionId is 'ulid' compatible
-func ValidateVersionId(versionId string) error {
-	if versionId == "" || versionId == "null" {
-		return nil
-	}
-	_, err := ulid.Parse(versionId)
-	if err != nil {
-		debuglogger.Logf("invalid versionId: %s", versionId)
-		return s3err.GetAPIError(s3err.ErrInvalidVersionId)
-	}
-
-	return nil
 }
 
 // GenerateObjectLocation generates the object location path-styled or host-styled
