@@ -16,6 +16,7 @@ package controllers
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -84,7 +85,7 @@ func (c S3ApiController) HeadObject(ctx *fiber.Ctx) (*Response, error) {
 			Acc:             acct,
 			Bucket:          bucket,
 			Object:          key,
-			Action:          action,
+			Actions:         []auth.Action{action},
 			IsPublicRequest: isPublicBucket,
 			DisableACL:      c.disableACL,
 		})
@@ -105,6 +106,15 @@ func (c S3ApiController) HeadObject(ctx *fiber.Ctx) (*Response, error) {
 					BucketOwner: parsedAcl.Owner,
 				},
 			}, s3err.GetAPIError(s3err.ErrInvalidPartNumber)
+		}
+
+		if objRange != "" {
+			debuglogger.Logf("Range and partNumber cannot both be specified")
+			return &Response{
+				MetaOpts: &MetaOptions{
+					BucketOwner: parsedAcl.Owner,
+				},
+			}, s3err.GetAPIError(s3err.ErrRangeAndPartNumber)
 		}
 
 		partNumber = &partNumberQuery
@@ -154,6 +164,11 @@ func (c S3ApiController) HeadObject(ctx *fiber.Ctx) (*Response, error) {
 	// Set the metadata headers
 	utils.SetMetaHeaders(ctx, res.Metadata)
 
+	status := http.StatusOK
+	if res.ContentRange != nil && *res.ContentRange != "" {
+		status = http.StatusPartialContent
+	}
+
 	return &Response{
 		Headers: map[string]*string{
 			"Content-Range":                       res.ContentRange,
@@ -173,6 +188,11 @@ func (c S3ApiController) HeadObject(ctx *fiber.Ctx) (*Response, error) {
 			"x-amz-checksum-crc32c":               res.ChecksumCRC32C,
 			"x-amz-checksum-sha1":                 res.ChecksumSHA1,
 			"x-amz-checksum-sha256":               res.ChecksumSHA256,
+			"x-amz-checksum-sha512":               res.ChecksumSHA512,
+			"x-amz-checksum-md5":                  res.ChecksumMD5,
+			"x-amz-checksum-xxhash64":             res.ChecksumXXHASH64,
+			"x-amz-checksum-xxhash3":              res.ChecksumXXHASH3,
+			"x-amz-checksum-xxhash128":            res.ChecksumXXHASH128,
 			"x-amz-version-id":                    res.VersionId,
 			"x-amz-mp-parts-count":                utils.ConvertPtrToStringPtr(res.PartsCount),
 			"x-amz-object-lock-mode":              utils.ConvertToStringPtr(res.ObjectLockMode),
@@ -184,6 +204,7 @@ func (c S3ApiController) HeadObject(ctx *fiber.Ctx) (*Response, error) {
 		},
 		MetaOpts: &MetaOptions{
 			BucketOwner: parsedAcl.Owner,
+			Status:      status,
 		},
 	}, nil
 }

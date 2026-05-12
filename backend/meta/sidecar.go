@@ -20,6 +20,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
+
+	"github.com/versity/versitygw/s3err"
 )
 
 // SideCar is a metadata storer that uses sidecar files to store metadata.
@@ -71,12 +74,18 @@ func (s SideCar) StoreAttribute(_ *os.File, bucket, object, attribute string, va
 	}
 	err := os.MkdirAll(metadir, 0777)
 	if err != nil {
+		if errors.Is(err, syscall.ENOSPC) {
+			return s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
+		}
 		return fmt.Errorf("failed to create metadata directory: %v", err)
 	}
 
 	attr := filepath.Join(metadir, attribute)
 	tempfile, err := os.CreateTemp(metadir, attribute)
 	if err != nil {
+		if errors.Is(err, syscall.ENOSPC) {
+			return s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
+		}
 		return fmt.Errorf("failed to create temporary file: %v", err)
 	}
 	defer os.Remove(tempfile.Name())
@@ -84,6 +93,9 @@ func (s SideCar) StoreAttribute(_ *os.File, bucket, object, attribute string, va
 	_, err = tempfile.Write(value)
 	if err != nil {
 		tempfile.Close()
+		if errors.Is(err, syscall.ENOSPC) {
+			return s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
+		}
 		return fmt.Errorf("failed to write attribute: %v", err)
 	}
 
@@ -145,15 +157,24 @@ func (s SideCar) ListAttributes(bucket, object string) ([]string, error) {
 }
 
 // DeleteAttributes removes all attributes for an object or a bucket.
+// When object is empty the entire bucket sidecar directory is removed,
+// cleaning up any orphaned object or multipart metadata within it.
 func (s SideCar) DeleteAttributes(bucket, object string) error {
-	metadir := filepath.Join(s.dir, bucket, object, sidecarmeta)
 	if object == "" {
-		metadir = filepath.Join(s.dir, bucket, sidecarmeta)
+		// Remove the entire bucket sidecar directory so that orphaned
+		// object/multipart metadata does not accumulate after DeleteBucket.
+		bucketDir := filepath.Join(s.dir, bucket)
+		err := os.RemoveAll(bucketDir)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("failed to remove bucket attributes: %w", err)
+		}
+		return nil
 	}
 
+	metadir := filepath.Join(s.dir, bucket, object, sidecarmeta)
 	err := os.RemoveAll(metadir)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("failed to remove attributes: %v", err)
+		return fmt.Errorf("failed to remove attributes: %w", err)
 	}
 	s.cleanupEmptyDirs(metadir, bucket, object)
 	return nil
@@ -167,6 +188,9 @@ func (s SideCar) RenameObject(bucket, oldObject, newObject string) error {
 	newPath := filepath.Join(s.dir, bucket, newObject)
 
 	if err := os.MkdirAll(filepath.Dir(newPath), 0777); err != nil {
+		if errors.Is(err, syscall.ENOSPC) {
+			return s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
+		}
 		return fmt.Errorf("create parent for renamed metadata: %w", err)
 	}
 

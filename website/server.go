@@ -17,6 +17,7 @@ package website
 import (
 	"fmt"
 	"net"
+	"os"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/logger"
@@ -33,6 +34,7 @@ type Server struct {
 	quiet          bool
 	proxyHeader    string
 	trustedProxies []string
+	socketPerm     os.FileMode
 }
 
 // Option sets various options for NewServer().
@@ -58,6 +60,13 @@ func WithProxyHeader(header string) Option {
 // proxy header on the website server.
 func WithTrustedProxies(proxies []string) Option {
 	return func(s *Server) { s.trustedProxies = proxies }
+}
+
+// WithSocketPerm sets the file-mode permissions applied to file-backed UNIX
+// domain sockets after binding. It has no effect on TCP/IP or abstract
+// namespace sockets.
+func WithSocketPerm(perm os.FileMode) Option {
+	return func(s *Server) { s.socketPerm = perm }
 }
 
 // NewServer creates a new static website hosting server.
@@ -121,9 +130,9 @@ func (s *Server) ServeMultiPort(ports []string) error {
 		var err error
 
 		if s.CertStorage != nil {
-			ln, err = utils.NewMultiAddrTLSListener(s.app.Config().Network, addrSpec, s.CertStorage.GetCertificate)
+			ln, err = utils.NewMultiAddrTLSListener(s.app.Config().Network, addrSpec, s.CertStorage.GetCertificate, utils.ListenerOptions{SocketPerm: s.socketPerm})
 		} else {
-			ln, err = utils.NewMultiAddrListener(s.app.Config().Network, addrSpec)
+			ln, err = utils.NewMultiAddrListener(s.app.Config().Network, addrSpec, utils.ListenerOptions{SocketPerm: s.socketPerm})
 		}
 
 		if err != nil {

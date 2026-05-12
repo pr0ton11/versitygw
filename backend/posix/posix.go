@@ -137,6 +137,7 @@ const (
 	deleteMarkerKey     = "delete-marker"
 	versionIdKey        = "version-id"
 	partCrc64nvme       = "part-crc64nvme"
+	mpMetaKey           = "mp-metadata"
 
 	nullVersionId = "null"
 
@@ -641,6 +642,13 @@ func (p *Posix) DeleteBucket(ctx context.Context, bucket string) error {
 	if err != nil {
 		return fmt.Errorf("remove bucket: %w", err)
 	}
+	// Bucket data is already removed; a metadata cleanup failure orphans only
+	// the sidecar directory, which is not user-visible. Log and continue rather
+	// than returning an error that would mislead callers into thinking the
+	// bucket still exists.
+	if err = p.meta.DeleteAttributes(bucket, ""); err != nil {
+		debuglogger.Logf("failed to delete bucket sidecar attributes (%q): %v", bucket, err)
+	}
 	// Remove the bucket from versioning directory
 	if p.versioningEnabled() {
 		err = os.RemoveAll(filepath.Join(p.versioningDir, bucket))
@@ -882,8 +890,12 @@ func (p *Posix) deleteNullVersionIdObject(bucket, key string) error {
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
+	if err != nil {
+		return err
+	}
 
-	return err
+	_ = p.meta.DeleteAttributes(versionPath, "")
+	return nil
 }
 
 func isRemovableAttr(attr string) bool {
@@ -1040,6 +1052,18 @@ func getBoolPtr(b bool) *bool {
 func (p *Posix) ensureNotDeleteMarker(bucket, object, versionId string) error {
 	if !p.versioningEnabled() {
 		return nil
+	}
+
+	// With path-based metadata backends (e.g. sidecar), RetrieveAttribute
+	// returns ErrNoSuchKey whether the sidecar attribute is absent OR the
+	// data file simply doesn't exist — the two cases are indistinguishable
+	// from metadata alone.  Verify the data file directly so callers
+	// receive the correct NoSuchVersion / NoSuchKey error.
+	if _, statErr := os.Stat(filepath.Join(bucket, object)); errors.Is(statErr, fs.ErrNotExist) || errors.Is(statErr, syscall.ENOTDIR) {
+		if versionId != "" {
+			return s3err.GetAPIError(s3err.ErrNoSuchVersion)
+		}
+		return s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 
 	_, err := p.meta.RetrieveAttribute(nil, bucket, object, deleteMarkerKey)
@@ -1518,6 +1542,7 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 			// cleanup object if returning error
 			os.RemoveAll(filepath.Join(tmppath, uploadID))
 			os.Remove(tmppath)
+			_ = p.meta.DeleteAttributes(bucket, filepath.Join(objdir, uploadID))
 			return s3response.InitiateMultipartUploadResult{}, err
 		}
 	}
@@ -1536,6 +1561,7 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 		// cleanup object if returning error
 		os.RemoveAll(filepath.Join(tmppath, uploadID))
 		os.Remove(tmppath)
+		_ = p.meta.DeleteAttributes(bucket, filepath.Join(objdir, uploadID))
 		return s3response.InitiateMultipartUploadResult{}, err
 	}
 
@@ -1549,6 +1575,7 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 			// cleanup object if returning error
 			os.RemoveAll(filepath.Join(tmppath, uploadID))
 			os.Remove(tmppath)
+			_ = p.meta.DeleteAttributes(bucket, filepath.Join(objdir, uploadID))
 			return s3response.InitiateMultipartUploadResult{}, err
 		}
 	}
@@ -1564,6 +1591,7 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 			// cleanup object if returning error
 			os.RemoveAll(filepath.Join(tmppath, uploadID))
 			os.Remove(tmppath)
+			_ = p.meta.DeleteAttributes(bucket, filepath.Join(objdir, uploadID))
 			return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("parse object lock retention: %w", err)
 		}
 		err = p.PutObjectRetention(withCtxNoSlot(ctx), bucket, filepath.Join(objdir, uploadID), "", retParsed)
@@ -1574,6 +1602,7 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 			// cleanup object if returning error
 			os.RemoveAll(filepath.Join(tmppath, uploadID))
 			os.Remove(tmppath)
+			_ = p.meta.DeleteAttributes(bucket, filepath.Join(objdir, uploadID))
 			return s3response.InitiateMultipartUploadResult{}, err
 		}
 	}
@@ -1588,6 +1617,7 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 			// cleanup object if returning error
 			_ = os.RemoveAll(filepath.Join(tmppath, uploadID))
 			_ = os.Remove(tmppath)
+			_ = p.meta.DeleteAttributes(bucket, filepath.Join(objdir, uploadID))
 			return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("store mp checksum algorithm: %w", err)
 		}
 	}
@@ -1630,8 +1660,76 @@ func getPartChecksum(algo types.ChecksumAlgorithm, part types.CompletedPart) str
 		return backend.GetStringFromPtr(part.ChecksumSHA256)
 	case types.ChecksumAlgorithmCrc64nvme:
 		return backend.GetStringFromPtr(part.ChecksumCRC64NVME)
+	case types.ChecksumAlgorithmSha512:
+		return backend.GetStringFromPtr(part.ChecksumSHA512)
+	case types.ChecksumAlgorithmMd5:
+		return backend.GetStringFromPtr(part.ChecksumMD5)
+	case types.ChecksumAlgorithmXxhash64:
+		return backend.GetStringFromPtr(part.ChecksumXXHASH64)
+	case types.ChecksumAlgorithmXxhash3:
+		return backend.GetStringFromPtr(part.ChecksumXXHASH3)
+	case types.ChecksumAlgorithmXxhash128:
+		return backend.GetStringFromPtr(part.ChecksumXXHASH128)
 	default:
 		return ""
+	}
+}
+
+func setStoredChecksum(checksum *s3response.Checksum, algo types.ChecksumAlgorithm, sum *string) {
+	if sum == nil {
+		return
+	}
+
+	switch algo {
+	case types.ChecksumAlgorithmCrc32:
+		checksum.CRC32 = sum
+	case types.ChecksumAlgorithmCrc32c:
+		checksum.CRC32C = sum
+	case types.ChecksumAlgorithmSha1:
+		checksum.SHA1 = sum
+	case types.ChecksumAlgorithmSha256:
+		checksum.SHA256 = sum
+	case types.ChecksumAlgorithmCrc64nvme:
+		checksum.CRC64NVME = sum
+	case types.ChecksumAlgorithmSha512:
+		checksum.SHA512 = sum
+	case types.ChecksumAlgorithmMd5:
+		checksum.MD5 = sum
+	case types.ChecksumAlgorithmXxhash64:
+		checksum.XXHASH64 = sum
+	case types.ChecksumAlgorithmXxhash3:
+		checksum.XXHASH3 = sum
+	case types.ChecksumAlgorithmXxhash128:
+		checksum.XXHASH128 = sum
+	}
+}
+
+func setUploadPartChecksum(res *s3.UploadPartOutput, algo types.ChecksumAlgorithm, sum *string) {
+	if sum == nil {
+		return
+	}
+
+	switch algo {
+	case types.ChecksumAlgorithmCrc32:
+		res.ChecksumCRC32 = sum
+	case types.ChecksumAlgorithmCrc32c:
+		res.ChecksumCRC32C = sum
+	case types.ChecksumAlgorithmSha1:
+		res.ChecksumSHA1 = sum
+	case types.ChecksumAlgorithmSha256:
+		res.ChecksumSHA256 = sum
+	case types.ChecksumAlgorithmCrc64nvme:
+		res.ChecksumCRC64NVME = sum
+	case types.ChecksumAlgorithmSha512:
+		res.ChecksumSHA512 = sum
+	case types.ChecksumAlgorithmMd5:
+		res.ChecksumMD5 = sum
+	case types.ChecksumAlgorithmXxhash64:
+		res.ChecksumXXHASH64 = sum
+	case types.ChecksumAlgorithmXxhash3:
+		res.ChecksumXXHASH3 = sum
+	case types.ChecksumAlgorithmXxhash128:
+		res.ChecksumXXHASH128 = sum
 	}
 }
 
@@ -1691,25 +1789,69 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		return res, "", fmt.Errorf("stat bucket: %w", err)
 	}
 
-	sum, err := p.checkUploadIDExists(bucket, object, uploadID)
-	if err != nil {
-		return res, "", err
-	}
-
-	// Atomically rename the upload directory to <uploadID>.inprogress so that
-	// concurrent CompleteMultipartUpload calls for the same upload ID see it as
-	// absent and return ErrNoSuchUpload rather than racing through the rest of
-	// the function.  If this call does not succeed we rename it back (see the
-	// deferred cleanup below).
+	// Rename the upload directory to <uploadId><ETag> to atomically claim
+	// the processing slot. A concurrent call with the same uploadId will compute
+	// the same ETag, so it will either find the directory still present (still
+	// processing) or gone (already completed) and react accordingly.
+	sum := sha256.Sum256([]byte(object))
 	objdirFull := filepath.Join(bucket, MetaTmpMultipartDir, fmt.Sprintf("%x", sum))
 	uploadIDDir := filepath.Join(objdirFull, uploadID)
-	activeUploadName := uploadID + inProgressSuffix
+	// Calculate s3 compatible md5sum for complete multipart.
+	s3MD5, err := backend.GetMultipartMD5(parts)
+	if err != nil {
+		return res, "", s3err.GetAPIError(s3err.ErrInvalidPart)
+	}
+	activeUploadName := fmt.Sprintf("%s.%s%s", uploadID, strings.Trim(s3MD5, "\""), inProgressSuffix)
 	uploadIDInProgress := filepath.Join(objdirFull, activeUploadName)
-	if err := os.Rename(uploadIDDir, uploadIDInProgress); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return res, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
+
+	err = os.Rename(uploadIDDir, uploadIDInProgress)
+	if errors.Is(err, fs.ErrNotExist) {
+		// Another call already claimed this slot and is still assembling the object.
+		if _, statErr := os.Stat(uploadIDInProgress); statErr == nil {
+			// Still in progress — treat as success for idempotency.
+			return s3response.CompleteMultipartUploadResult{
+				Bucket: &bucket,
+				ETag:   &s3MD5,
+				Key:    &object,
+			}, "", nil
 		}
-		return res, "", fmt.Errorf("mark upload in-progress: %w", err)
+		// Directory is gone: the concurrent call already completed and cleaned up.
+		if _, statErr := os.Stat(filepath.Join(bucket, object)); statErr == nil {
+			return s3response.CompleteMultipartUploadResult{
+				Bucket: &bucket,
+				ETag:   &s3MD5,
+				Key:    &object,
+			}, "", nil
+		}
+
+		// Last resort: the object stat above may have lost a race with the
+		// concurrent call's link step. Check the mp-metadata xattr, as this
+		// multipart upload may have been finalized and the final object has been created
+		// before or by the racing request
+		if mpMetaBytes, statErr := p.meta.RetrieveAttribute(nil, bucket, object, mpMetaKey); statErr == nil {
+			var mpMeta backend.MpUploadMetadata
+			if err := json.Unmarshal(mpMetaBytes, &mpMeta); err != nil {
+				return res, "", fmt.Errorf("parse object multipart metadata: %w", err)
+			}
+
+			// The object may have been overwritten by a newer upload or
+			// it's the result of a completely different multipart upload; only
+			// treat it as our completion if the upload IDs match.
+			if mpMeta.UploadID != uploadID {
+				return res, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
+			}
+
+			return s3response.CompleteMultipartUploadResult{
+				Bucket: &bucket,
+				ETag:   &s3MD5,
+				Key:    &object,
+			}, "", nil
+		}
+
+		return res, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
+	}
+	if err != nil {
+		return res, "", fmt.Errorf("rename upload to etag dir: %w", err)
 	}
 
 	// Rename sidecar metadata to match the new data directory path.
@@ -1762,11 +1904,23 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		checksums.Algorithm = types.ChecksumAlgorithmCrc64nvme
 	}
 
+	// Initialize composite checksum reader
+	var compositeChecksumRdr *utils.CompositeChecksumReader
+	if checksums.Type == types.ChecksumTypeComposite {
+		compositeChecksumRdr, err = utils.NewCompositeChecksumReader(utils.HashType(strings.ToLower(string(checksums.Algorithm))))
+		if err != nil {
+			return res, "", fmt.Errorf("initialize composite checksum reader: %w", err)
+		}
+	}
+
 	// check all parts ok
 	last := len(parts) - 1
 	var totalsize int64
+	// cumulative byte offsets: partSizes[i] = sum of sizes of parts 1..i+1
+	var partSizes []int64
+	var composableCsum string
 
-	// The initialie values is the lower limit of partNumber: 0
+	// The initial value is the lower limit of partNumber: 0
 	var partNumber int32
 	for i, part := range parts {
 		if part.PartNumber == nil {
@@ -1789,6 +1943,7 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		}
 
 		totalsize += fi.Size()
+		partSizes = append(partSizes, totalsize)
 		// all parts except the last need to be greater, than or equal to
 		// the minimum allowed size (5 Mib)
 		if i < last && fi.Size() < backend.MinPartSize {
@@ -1814,18 +1969,111 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		if err != nil {
 			return res, "", err
 		}
+
+		// Accumulate checksum state.
+		switch checksums.Type {
+		case types.ChecksumTypeFullObject:
+			var pcs string
+			if mpChecksumType != "" {
+				pcs = getPartChecksum(checksums.Algorithm, part)
+			} else {
+				crc64nvme, err := p.meta.RetrieveAttribute(nil, bucket, partObjPath, partCrc64nvme)
+				if err != nil {
+					return res, "", fmt.Errorf("retrieve part internal crc64nvme: %w", err)
+				}
+				pcs = string(crc64nvme)
+			}
+			if i == 0 {
+				composableCsum = pcs
+			} else {
+				composableCsum, err = utils.AddCRCChecksum(checksums.Algorithm, composableCsum, pcs, fi.Size())
+				if err != nil {
+					return res, "", fmt.Errorf("add part %v checksum: %w", *part.PartNumber, err)
+				}
+			}
+		case types.ChecksumTypeComposite:
+			if err := compositeChecksumRdr.Process(getPartChecksum(checksums.Algorithm, part)); err != nil {
+				return res, "", fmt.Errorf("process %v part checksum: %w", *part.PartNumber, err)
+			}
+		}
 	}
 
 	if input.MpuObjectSize != nil && totalsize != *input.MpuObjectSize {
 		return res, "", s3err.GetIncorrectMpObjectSizeErr(totalsize, *input.MpuObjectSize)
 	}
 
-	var compositeChecksumRdr *utils.CompositeChecksumReader
-	if checksums.Type == types.ChecksumTypeComposite {
-		// initialize the composite checksum reader if the mp checksum type is COMPOSITE
-		compositeChecksumRdr, err = utils.NewCompositeChecksumReader(utils.HashType(strings.ToLower(string(checksums.Algorithm))))
-		if err != nil {
-			return res, "", fmt.Errorf("initialize composite checksum reader: %w", err)
+	// Compute the final checksum value.
+	var value string
+	switch checksums.Type {
+	case types.ChecksumTypeComposite:
+		value = fmt.Sprintf("%s-%v", compositeChecksumRdr.Sum(), len(parts))
+	case types.ChecksumTypeFullObject:
+		value = composableCsum
+	}
+
+	var crc32 *string
+	var crc32c *string
+	var sha1 *string
+	var sha256 *string
+	var crc64nvme *string
+	var sha512 *string
+	var md5sum *string
+	var xxhash64 *string
+	var xxhash3 *string
+	var xxhash128 *string
+	var gotSum *string
+
+	switch checksums.Algorithm {
+	case types.ChecksumAlgorithmCrc32:
+		gotSum = input.ChecksumCRC32
+		checksums.CRC32 = &value
+		crc32 = &value
+	case types.ChecksumAlgorithmCrc32c:
+		gotSum = input.ChecksumCRC32C
+		checksums.CRC32C = &value
+		crc32c = &value
+	case types.ChecksumAlgorithmSha1:
+		gotSum = input.ChecksumSHA1
+		checksums.SHA1 = &value
+		sha1 = &value
+	case types.ChecksumAlgorithmSha256:
+		gotSum = input.ChecksumSHA256
+		checksums.SHA256 = &value
+		sha256 = &value
+	case types.ChecksumAlgorithmCrc64nvme:
+		gotSum = input.ChecksumCRC64NVME
+		checksums.CRC64NVME = &value
+		crc64nvme = &value
+	case types.ChecksumAlgorithmSha512:
+		gotSum = input.ChecksumSHA512
+		checksums.SHA512 = &value
+		sha512 = &value
+	case types.ChecksumAlgorithmMd5:
+		gotSum = input.ChecksumMD5
+		checksums.MD5 = &value
+		md5sum = &value
+	case types.ChecksumAlgorithmXxhash64:
+		gotSum = input.ChecksumXXHASH64
+		checksums.XXHASH64 = &value
+		xxhash64 = &value
+	case types.ChecksumAlgorithmXxhash3:
+		gotSum = input.ChecksumXXHASH3
+		checksums.XXHASH3 = &value
+		xxhash3 = &value
+	case types.ChecksumAlgorithmXxhash128:
+		gotSum = input.ChecksumXXHASH128
+		checksums.XXHASH128 = &value
+		xxhash128 = &value
+	}
+
+	// Check if the provided checksum and the calculated one are the same.
+	if mpChecksumType != "" && gotSum != nil {
+		s := *gotSum
+		if checksums.Type == types.ChecksumTypeComposite && !strings.Contains(s, "-") {
+			s = fmt.Sprintf("%s-%v", s, len(parts))
+		}
+		if s != value {
+			return res, "", s3err.GetChecksumBadDigestErr(checksums.Algorithm)
 		}
 	}
 
@@ -1835,59 +2083,20 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		if errors.Is(err, syscall.EDQUOT) {
 			return res, "", s3err.GetAPIError(s3err.ErrQuotaExceeded)
 		}
+		if errors.Is(err, syscall.ENOSPC) {
+			return res, "", s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
+		}
 		return res, "", fmt.Errorf("open temp file: %w", err)
 	}
 	defer f.cleanup()
 
-	var composableCsum string
 	var abortOnErrSet bool
-	for i, part := range parts {
+	for _, part := range parts {
 		partObjPath := filepath.Join(objdir, activeUploadName, fmt.Sprintf("%v", *part.PartNumber))
 		fullPartPath := filepath.Join(bucket, partObjPath)
 		pf, err := os.Open(fullPartPath)
 		if err != nil {
 			return res, "", fmt.Errorf("open part %v: %v", *part.PartNumber, err)
-		}
-		pfi, err := pf.Stat()
-		if err != nil {
-			pf.Close()
-			return res, "", fmt.Errorf("stat part %v: %v", *part.PartNumber, err)
-		}
-
-		switch checksums.Type {
-		case types.ChecksumTypeFullObject:
-			var partChecksum string
-			if mpChecksumType != "" {
-				// if any checksum has been initially specified on mp creation
-				// read the part checksum configuration
-				partChecksum = getPartChecksum(checksums.Algorithm, part)
-			} else {
-				// if no checksum has been specified on mp creation
-				// retrieve the internally stored crc64nvme
-				crc64nvme, err := p.meta.RetrieveAttribute(pf, bucket, partObjPath, partCrc64nvme)
-				if err != nil {
-					pf.Close()
-					return res, "", fmt.Errorf("retrieve part internal crc64nvme: %w", err)
-				}
-				partChecksum = string(crc64nvme)
-			}
-			if i == 0 {
-				composableCsum = partChecksum
-				break
-			}
-			composableCsum, err = utils.AddCRCChecksum(checksums.Algorithm, composableCsum, partChecksum, pfi.Size())
-			if err != nil {
-				pf.Close()
-				return res, "", fmt.Errorf("add part %v checksum: %w",
-					*part.PartNumber, err)
-			}
-		case types.ChecksumTypeComposite:
-			err := compositeChecksumRdr.Process(getPartChecksum(checksums.Algorithm, part))
-			if err != nil {
-				pf.Close()
-				return res, "", fmt.Errorf("process %v part checksum: %w",
-					*part.PartNumber, err)
-			}
 		}
 
 		if customCopy != nil {
@@ -1932,6 +2141,9 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 			if errors.Is(err, syscall.EDQUOT) {
 				return res, "", s3err.GetAPIError(s3err.ErrQuotaExceeded)
 			}
+			if errors.Is(err, syscall.ENOSPC) {
+				return res, "", s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
+			}
 			return res, "", fmt.Errorf("copy part %v: %v", part.PartNumber, err)
 		}
 	}
@@ -1968,6 +2180,10 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		if err != nil {
 			return res, "", fmt.Errorf("create object version: %w", err)
 		}
+		// Clean up object-lock attrs that may have leaked from the previous
+		// version's path-based metadata into this (new) version's sidecar.
+		_ = p.meta.DeleteAttribute(bucket, object, objectLegalHoldKey)
+		_ = p.meta.DeleteAttribute(bucket, object, objectRetentionKey)
 	}
 
 	// if the versioning is enabled, generate a new versionID for the object
@@ -2005,59 +2221,6 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		}
 	}
 
-	var crc32 *string
-	var crc32c *string
-	var sha1 *string
-	var sha256 *string
-	var crc64nvme *string
-
-	var value string
-	switch checksums.Type {
-	case types.ChecksumTypeComposite:
-		value = fmt.Sprintf("%s-%v", compositeChecksumRdr.Sum(), len(parts))
-	case types.ChecksumTypeFullObject:
-		value = composableCsum
-	}
-
-	var gotSum *string
-
-	switch checksums.Algorithm {
-	case types.ChecksumAlgorithmCrc32:
-		gotSum = input.ChecksumCRC32
-		checksums.CRC32 = &value
-		crc32 = &value
-	case types.ChecksumAlgorithmCrc32c:
-		gotSum = input.ChecksumCRC32C
-		checksums.CRC32C = &value
-		crc32c = &value
-	case types.ChecksumAlgorithmSha1:
-		gotSum = input.ChecksumSHA1
-		checksums.SHA1 = &value
-		sha1 = &value
-	case types.ChecksumAlgorithmSha256:
-		gotSum = input.ChecksumSHA256
-		checksums.SHA256 = &value
-		sha256 = &value
-	case types.ChecksumAlgorithmCrc64nvme:
-		gotSum = input.ChecksumCRC64NVME
-		checksums.CRC64NVME = &value
-		crc64nvme = &value
-	}
-
-	// Check if the provided checksum and the calculated one are the same
-	if mpChecksumType != "" && gotSum != nil {
-		s := *gotSum
-		if checksums.Type == types.ChecksumTypeComposite && !strings.Contains(s, "-") {
-			// if number of parts is not specified in the final checksum
-			// make sure to add, to not fail in the final comparison
-			s = fmt.Sprintf("%s-%v", s, len(parts))
-		}
-
-		if s != value {
-			return res, "", s3err.GetChecksumBadDigestErr(checksums.Algorithm)
-		}
-	}
-
 	err = p.storeChecksums(f.File(), bucket, object, checksums)
 	if err != nil {
 		return res, "", fmt.Errorf("store object checksum: %w", err)
@@ -2075,12 +2238,22 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		}
 	}
 
-	// Calculate s3 compatible md5sum for complete multipart.
-	s3MD5 := backend.GetMultipartMD5(parts)
-
 	err = p.meta.StoreAttribute(f.File(), bucket, object, etagkey, []byte(s3MD5))
 	if err != nil {
 		return res, "", fmt.Errorf("set etag attr: %w", err)
+	}
+
+	// Store multipart upload metadata on the final object so that GetObject /
+	// HeadObject can serve individual parts by part-number.
+	mpMeta := backend.MpUploadMetadata{UploadID: uploadID, Parts: partSizes}
+	mpMetaJSON, err := json.Marshal(mpMeta)
+	if err != nil {
+		return res, "", fmt.Errorf("marshal object multipart metadata: %w", err)
+	}
+
+	err = p.meta.StoreAttribute(f.File(), bucket, object, mpMetaKey, mpMetaJSON)
+	if err != nil {
+		return res, "", fmt.Errorf("set object multipart metadata: %w", err)
 	}
 
 	err = f.link()
@@ -2103,6 +2276,11 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		ChecksumSHA1:      sha1,
 		ChecksumSHA256:    sha256,
 		ChecksumCRC64NVME: crc64nvme,
+		ChecksumSHA512:    sha512,
+		ChecksumMD5:       md5sum,
+		ChecksumXXHASH64:  xxhash64,
+		ChecksumXXHASH3:   xxhash3,
+		ChecksumXXHASH128: xxhash128,
 		ChecksumType:      &checksums.Type,
 	}, versionID, nil
 }
@@ -2139,6 +2317,11 @@ func validatePartChecksum(checksum s3response.Checksum, part types.CompletedPart
 		{part.ChecksumSHA1, getString(checksum.SHA1), types.ChecksumAlgorithmSha1},
 		{part.ChecksumSHA256, getString(checksum.SHA256), types.ChecksumAlgorithmSha256},
 		{part.ChecksumCRC64NVME, getString(checksum.CRC64NVME), types.ChecksumAlgorithmCrc64nvme},
+		{part.ChecksumSHA512, getString(checksum.SHA512), types.ChecksumAlgorithmSha512},
+		{part.ChecksumMD5, getString(checksum.MD5), types.ChecksumAlgorithmMd5},
+		{part.ChecksumXXHASH64, getString(checksum.XXHASH64), types.ChecksumAlgorithmXxhash64},
+		{part.ChecksumXXHASH3, getString(checksum.XXHASH3), types.ChecksumAlgorithmXxhash3},
+		{part.ChecksumXXHASH128, getString(checksum.XXHASH128), types.ChecksumAlgorithmXxhash128},
 	} {
 		if cs.checksum == nil {
 			continue
@@ -2179,6 +2362,21 @@ func numberOfChecksums(part types.CompletedPart) int {
 		counter++
 	}
 	if getString(part.ChecksumCRC64NVME) != "" {
+		counter++
+	}
+	if getString(part.ChecksumSHA512) != "" {
+		counter++
+	}
+	if getString(part.ChecksumMD5) != "" {
+		counter++
+	}
+	if getString(part.ChecksumXXHASH64) != "" {
+		counter++
+	}
+	if getString(part.ChecksumXXHASH3) != "" {
+		counter++
+	}
+	if getString(part.ChecksumXXHASH128) != "" {
 		counter++
 	}
 
@@ -2448,6 +2646,11 @@ func (p *Posix) AbortMultipartUpload(ctx context.Context, mpu *s3.AbortMultipart
 	}
 	os.Remove(objdir)
 
+	// Clean up sidecar metadata for the aborted upload.  With xattr this is
+	// a no-op; with sidecar the metadata directory would otherwise be orphaned.
+	uploadMetaPath := filepath.Join(MetaTmpMultipartDir, fmt.Sprintf("%x", sum), uploadID)
+	_ = p.meta.DeleteAttributes(bucket, uploadMetaPath)
+
 	return nil
 }
 
@@ -2700,6 +2903,11 @@ func (p *Posix) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3resp
 			ChecksumSHA1:      checksum.SHA1,
 			ChecksumSHA256:    checksum.SHA256,
 			ChecksumCRC64NVME: checksum.CRC64NVME,
+			ChecksumSHA512:    checksum.SHA512,
+			ChecksumMD5:       checksum.MD5,
+			ChecksumXXHASH64:  checksum.XXHASH64,
+			ChecksumXXHASH3:   checksum.XXHASH3,
+			ChecksumXXHASH128: checksum.XXHASH128,
 		})
 	}
 
@@ -2799,6 +3007,9 @@ func (p *Posix) UploadPartWithPostFunc(ctx context.Context, input *s3.UploadPart
 		if errors.Is(err, syscall.EDQUOT) {
 			return nil, s3err.GetAPIError(s3err.ErrQuotaExceeded)
 		}
+		if errors.Is(err, syscall.ENOSPC) {
+			return nil, s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
+		}
 		return nil, fmt.Errorf("open temp file: %w", err)
 	}
 	defer f.cleanup()
@@ -2821,6 +3032,11 @@ func (p *Posix) UploadPartWithPostFunc(ctx context.Context, input *s3.UploadPart
 			{input.ChecksumSHA1, utils.HashTypeSha1},
 			{input.ChecksumSHA256, utils.HashTypeSha256},
 			{input.ChecksumCRC64NVME, utils.HashTypeCRC64NVME},
+			{input.ChecksumSHA512, utils.HashTypeSha512},
+			{input.ChecksumMD5, utils.HashTypeMd5},
+			{input.ChecksumXXHASH64, utils.HashTypeXXHASH64},
+			{input.ChecksumXXHASH3, utils.HashTypeXXHASH3},
+			{input.ChecksumXXHASH128, utils.HashTypeXXHASH128},
 		}
 
 		for _, config := range hashConfigs {
@@ -2911,6 +3127,9 @@ func (p *Posix) UploadPartWithPostFunc(ctx context.Context, input *s3.UploadPart
 		if errors.Is(err, syscall.EDQUOT) {
 			return nil, s3err.GetAPIError(s3err.ErrQuotaExceeded)
 		}
+		if errors.Is(err, syscall.ENOSPC) {
+			return nil, s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
+		}
 		// Return the error itself, if it's an 's3err.APIError'
 		if _, ok := err.(s3err.APIError); ok {
 			return nil, err
@@ -2946,24 +3165,8 @@ func (p *Posix) UploadPartWithPostFunc(ctx context.Context, input *s3.UploadPart
 			sum = hashRdr.Sum()
 		}
 
-		// Assign the checksum
-		switch checksums.Algorithm {
-		case types.ChecksumAlgorithmCrc32:
-			checksum.CRC32 = &sum
-			res.ChecksumCRC32 = &sum
-		case types.ChecksumAlgorithmCrc32c:
-			checksum.CRC32C = &sum
-			res.ChecksumCRC32C = &sum
-		case types.ChecksumAlgorithmSha1:
-			checksum.SHA1 = &sum
-			res.ChecksumSHA1 = &sum
-		case types.ChecksumAlgorithmSha256:
-			checksum.SHA256 = &sum
-			res.ChecksumSHA256 = &sum
-		case types.ChecksumAlgorithmCrc64nvme:
-			checksum.CRC64NVME = &sum
-			res.ChecksumCRC64NVME = &sum
-		}
+		setStoredChecksum(&checksum, checksums.Algorithm, &sum)
+		setUploadPartChecksum(res, checksums.Algorithm, &sum)
 
 		err := p.storeChecksums(f.File(), bucket, partPath, checksum)
 		if err != nil {
@@ -3005,6 +3208,16 @@ func (p *Posix) UploadPartWithPostFunc(ctx context.Context, input *s3.UploadPart
 				res.ChecksumSHA256 = &sumToReturn
 			case utils.HashTypeCRC64NVME:
 				res.ChecksumCRC64NVME = &sumToReturn
+			case utils.HashTypeSha512:
+				res.ChecksumSHA512 = &sumToReturn
+			case utils.HashTypeMd5:
+				res.ChecksumMD5 = &sumToReturn
+			case utils.HashTypeXXHASH64:
+				res.ChecksumXXHASH64 = &sumToReturn
+			case utils.HashTypeXXHASH3:
+				res.ChecksumXXHASH3 = &sumToReturn
+			case utils.HashTypeXXHASH128:
+				res.ChecksumXXHASH128 = &sumToReturn
 			}
 		}
 	}
@@ -3175,6 +3388,9 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 		if errors.Is(err, syscall.EDQUOT) {
 			return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrQuotaExceeded)
 		}
+		if errors.Is(err, syscall.ENOSPC) {
+			return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
+		}
 		return s3response.CopyPartResult{}, fmt.Errorf("open temp file: %w", err)
 	}
 	defer f.cleanup()
@@ -3220,6 +3436,9 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 		if errors.Is(err, syscall.EDQUOT) {
 			return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrQuotaExceeded)
 		}
+		if errors.Is(err, syscall.ENOSPC) {
+			return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
+		}
 		return s3response.CopyPartResult{}, fmt.Errorf("copy part data: %w", err)
 	}
 
@@ -3243,18 +3462,7 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 		}
 
 		sum := hashRdr.Sum()
-		switch algo {
-		case types.ChecksumAlgorithmCrc32:
-			checksums.CRC32 = &sum
-		case types.ChecksumAlgorithmCrc32c:
-			checksums.CRC32C = &sum
-		case types.ChecksumAlgorithmSha1:
-			checksums.SHA1 = &sum
-		case types.ChecksumAlgorithmSha256:
-			checksums.SHA256 = &sum
-		case types.ChecksumAlgorithmCrc64nvme:
-			checksums.CRC64NVME = &sum
-		}
+		setStoredChecksum(&checksums, algo, &sum)
 
 		err := p.storeChecksums(f.File(), *upi.Bucket, partPath, checksums)
 		if err != nil {
@@ -3296,6 +3504,11 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 		ChecksumSHA1:        checksums.SHA1,
 		ChecksumSHA256:      checksums.SHA256,
 		ChecksumCRC64NVME:   checksums.CRC64NVME,
+		ChecksumSHA512:      checksums.SHA512,
+		ChecksumMD5:         checksums.MD5,
+		ChecksumXXHASH64:    checksums.XXHASH64,
+		ChecksumXXHASH3:     checksums.XXHASH3,
+		ChecksumXXHASH128:   checksums.XXHASH128,
 	}, nil
 }
 
@@ -3311,6 +3524,16 @@ func getEmptyChecksumValue(algo types.ChecksumAlgorithm) string {
 		return "2jmj7l5rSw0yVb/vlWAYkK/YBwk="
 	case types.ChecksumAlgorithmSha256:
 		return "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+	case types.ChecksumAlgorithmSha512:
+		return "z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg=="
+	case types.ChecksumAlgorithmMd5:
+		return "1B2M2Y8AsgTpgAmY7PhCfg=="
+	case types.ChecksumAlgorithmXxhash64:
+		return "70bbN1HY6Zk="
+	case types.ChecksumAlgorithmXxhash3:
+		return "LQaABTjTlMI="
+	case types.ChecksumAlgorithmXxhash128:
+		return "maoG0wFHmNhgAcMkRo1Jfw=="
 	default:
 		// default to crc64nvme
 		return "AAAAAAAAAAA="
@@ -3386,6 +3609,11 @@ func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObje
 			{po.ChecksumSHA1, utils.HashTypeSha1},
 			{po.ChecksumSHA256, utils.HashTypeSha256},
 			{po.ChecksumCRC64NVME, utils.HashTypeCRC64NVME},
+			{po.ChecksumSHA512, utils.HashTypeSha512},
+			{po.ChecksumMD5, utils.HashTypeMd5},
+			{po.ChecksumXXHASH64, utils.HashTypeXXHASH64},
+			{po.ChecksumXXHASH3, utils.HashTypeXXHASH3},
+			{po.ChecksumXXHASH128, utils.HashTypeXXHASH128},
 		}
 
 		for _, config := range hashConfigs {
@@ -3415,6 +3643,9 @@ func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObje
 		if err != nil {
 			if errors.Is(err, syscall.EDQUOT) {
 				return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrQuotaExceeded)
+			}
+			if errors.Is(err, syscall.ENOSPC) {
+				return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
 			}
 			return s3response.PutObjectOutput{}, err
 		}
@@ -3457,19 +3688,7 @@ func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObje
 			Algorithm: checksumAlgorithm,
 		}
 
-		// Store the calculated checksum in the object metadata
-		switch checksumAlgorithm {
-		case types.ChecksumAlgorithmCrc32:
-			checksum.CRC32 = &expectedSum
-		case types.ChecksumAlgorithmCrc32c:
-			checksum.CRC32C = &expectedSum
-		case types.ChecksumAlgorithmSha1:
-			checksum.SHA1 = &expectedSum
-		case types.ChecksumAlgorithmSha256:
-			checksum.SHA256 = &expectedSum
-		case types.ChecksumAlgorithmCrc64nvme:
-			checksum.CRC64NVME = &expectedSum
-		}
+		setStoredChecksum(&checksum, checksumAlgorithm, &expectedSum)
 
 		err = p.storeChecksums(nil, *po.Bucket, *po.Key, checksum)
 		if err != nil {
@@ -3486,6 +3705,11 @@ func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObje
 			ChecksumCRC64NVME: checksum.CRC64NVME,
 			ChecksumSHA1:      checksum.SHA1,
 			ChecksumSHA256:    checksum.SHA256,
+			ChecksumSHA512:    checksum.SHA512,
+			ChecksumMD5:       checksum.MD5,
+			ChecksumXXHASH64:  checksum.XXHASH64,
+			ChecksumXXHASH3:   checksum.XXHASH3,
+			ChecksumXXHASH128: checksum.XXHASH128,
 		}, nil
 	}
 
@@ -3516,6 +3740,13 @@ func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObje
 			if err != nil {
 				return s3response.PutObjectOutput{}, fmt.Errorf("create object version: %w", err)
 			}
+			// With path-based metadata backends (e.g. sidecar), object-lock
+			// attributes written on the previous version persist at this path
+			// after createObjVersion because metadata is not replaced atomically
+			// the way xattrs are on file rename.  Delete them so they do not
+			// bleed into the new version.
+			_ = p.meta.DeleteAttribute(*po.Bucket, *po.Key, objectLegalHoldKey)
+			_ = p.meta.DeleteAttribute(*po.Bucket, *po.Key, objectRetentionKey)
 		}
 	}
 	if errors.Is(err, syscall.ENAMETOOLONG) {
@@ -3536,6 +3767,9 @@ func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObje
 	if err != nil {
 		if errors.Is(err, syscall.EDQUOT) {
 			return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrQuotaExceeded)
+		}
+		if errors.Is(err, syscall.ENOSPC) {
+			return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
 		}
 		return s3response.PutObjectOutput{}, fmt.Errorf("open temp file: %w", err)
 	}
@@ -3560,6 +3794,9 @@ func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObje
 	if err != nil {
 		if errors.Is(err, syscall.EDQUOT) {
 			return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrQuotaExceeded)
+		}
+		if errors.Is(err, syscall.ENOSPC) {
+			return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
 		}
 		// Return the error itself, if it's an 's3err.APIError'
 		if _, ok := err.(s3err.APIError); ok {
@@ -3604,6 +3841,11 @@ func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObje
 			return s3response.PutObjectOutput{}, err
 		}
 		versionID = nullVersionId
+		// Clear any stale versionId sidecar attribute left from a previous
+		// versioned object at this path.  With xattr this is implicit (the
+		// new file carries only the attrs set on the tmpfile), but with
+		// path-based metadata the old attr persists until explicitly deleted.
+		_ = p.meta.DeleteAttribute(*po.Bucket, *po.Key, versionIdKey)
 	}
 
 	var sum string
@@ -3619,19 +3861,7 @@ func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObje
 		Algorithm: checksumAlgorithm,
 	}
 
-	// Store the calculated checksum in the object metadata
-	switch checksumAlgorithm {
-	case types.ChecksumAlgorithmCrc32:
-		checksum.CRC32 = &sum
-	case types.ChecksumAlgorithmCrc32c:
-		checksum.CRC32C = &sum
-	case types.ChecksumAlgorithmSha1:
-		checksum.SHA1 = &sum
-	case types.ChecksumAlgorithmSha256:
-		checksum.SHA256 = &sum
-	case types.ChecksumAlgorithmCrc64nvme:
-		checksum.CRC64NVME = &sum
-	}
+	setStoredChecksum(&checksum, checksumAlgorithm, &sum)
 	err = p.storeChecksums(f.File(), *po.Bucket, *po.Key, checksum)
 	if err != nil {
 		return s3response.PutObjectOutput{}, fmt.Errorf("store checksum: %w", err)
@@ -3732,6 +3962,11 @@ func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObje
 		ChecksumSHA1:      checksum.SHA1,
 		ChecksumSHA256:    checksum.SHA256,
 		ChecksumCRC64NVME: checksum.CRC64NVME,
+		ChecksumSHA512:    checksum.SHA512,
+		ChecksumMD5:       checksum.MD5,
+		ChecksumXXHASH64:  checksum.XXHASH64,
+		ChecksumXXHASH3:   checksum.XXHASH3,
+		ChecksumXXHASH128: checksum.XXHASH128,
 		Size:              &objsize,
 		ChecksumType:      checksum.Type,
 	}, nil
@@ -3881,6 +4116,16 @@ func (p *Posix) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (
 				return nil, fmt.Errorf("get obj versionId: %w", err)
 			}
 			if errors.Is(err, meta.ErrNoSuchKey) {
+				// With sidecar, ErrNoSuchKey means "attribute absent" regardless of
+				// whether the data file exists.  If the file is absent the object
+				// does not exist at all → AWS returns success for DeleteObject.
+				// Also handle ENOTDIR: when a key such as "foo/bar" is requested
+				// but "foo" is a regular file (not a directory), the path cannot
+				// contain any object.
+				_, statErr := os.Stat(filepath.Join(bucket, object))
+				if errors.Is(statErr, fs.ErrNotExist) || errors.Is(statErr, syscall.ENOTDIR) {
+					return &s3.DeleteObjectOutput{VersionId: input.VersionId}, nil
+				}
 				vId = []byte(nullVersionId)
 			}
 
@@ -3954,6 +4199,15 @@ func (p *Posix) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (
 					return nil, fmt.Errorf("link tmp file: %w", err)
 				}
 
+				// With path-based metadata (sidecar) the live object's attrs are
+				// not replaced atomically.  The restored version may not have all
+				// the attrs that the deleted version had (e.g. a null version has
+				// no versionIdKey).  Clear attrs that belong to the deleted version
+				// before copying the restored version's attrs so that the restored
+				// version presents a clean state.
+				_ = p.meta.DeleteAttribute(bucket, object, versionIdKey)
+				_ = p.meta.DeleteAttribute(bucket, object, deleteMarkerKey)
+
 				attrs, err := p.meta.ListAttributes(versionPath, srcVersionId)
 				if err != nil {
 					return nil, fmt.Errorf("list object attributes: %w", err)
@@ -3976,6 +4230,7 @@ func (p *Posix) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (
 					return nil, fmt.Errorf("remove obj version %w", err)
 				}
 
+				_ = p.meta.DeleteAttributes(versionPath, srcVersionId)
 				p.removeParents(filepath.Join(p.versioningDir, bucket), filepath.Join(genObjVersionKey(object), *input.VersionId))
 
 				return &s3.DeleteObjectOutput{
@@ -4002,6 +4257,7 @@ func (p *Posix) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (
 				return nil, fmt.Errorf("delete object: %w", err)
 			}
 
+			_ = p.meta.DeleteAttributes(versionPath, *input.VersionId)
 			p.removeParents(filepath.Join(p.versioningDir, bucket), filepath.Join(genObjVersionKey(object), *input.VersionId))
 
 			return &s3.DeleteObjectOutput{
@@ -4183,11 +4439,6 @@ func (p *Posix) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.Ge
 		return nil, err
 	}
 
-	if input.PartNumber != nil {
-		// querying an object by part number is not supported
-		return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
-	}
-
 	if !p.versioningEnabled() && versionId != "" {
 		//TODO: Maybe we need to return our custom error here?
 		return nil, s3err.GetAPIError(s3err.ErrInvalidVersionId)
@@ -4317,6 +4568,11 @@ func (p *Posix) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.Ge
 			ChecksumSHA1:       checksums.SHA1,
 			ChecksumSHA256:     checksums.SHA256,
 			ChecksumCRC64NVME:  checksums.CRC64NVME,
+			ChecksumSHA512:     checksums.SHA512,
+			ChecksumMD5:        checksums.MD5,
+			ChecksumXXHASH64:   checksums.XXHASH64,
+			ChecksumXXHASH3:    checksums.XXHASH3,
+			ChecksumXXHASH128:  checksums.XXHASH128,
 			ChecksumType:       checksums.Type,
 			AcceptRanges:       backend.GetPtrFromString("bytes"),
 			ContentLength:      &length,
@@ -4371,15 +4627,63 @@ func (p *Posix) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.Ge
 	}
 
 	objSize := fi.Size()
-	startOffset, length, isValid, err := backend.ParseObjectRange(objSize, *input.Range)
-	if err != nil {
-		return nil, err
+	if fi.IsDir() {
+		objSize = 0
 	}
 
-	var contentRange string
-	if isValid {
-		contentRange = fmt.Sprintf("bytes %v-%v/%v",
-			startOffset, startOffset+length-1, objSize)
+	var contentRange *string
+	var startOffset, length int64
+	var partsCount *int32
+
+	// If partNumber is requested and mp-metadata exists, serve that specific part.
+	// For non-multipart objects (no mp-metadata), partNumber=1 returns the full
+	// object with no Content-Range; any other partNumber is out of range.
+	// Both range read and partNumber can't be used together.
+	if input.PartNumber != nil {
+		mpMetaBytes, metaErr := p.meta.RetrieveAttribute(nil, bucket, object, mpMetaKey)
+		if metaErr == nil {
+			var mpMeta backend.MpUploadMetadata
+			if err := json.Unmarshal(mpMetaBytes, &mpMeta); err != nil {
+				return nil, fmt.Errorf("parse object multipart metadata: %w", err)
+			}
+
+			partNum := *input.PartNumber
+			totalParts := int32(len(mpMeta.Parts))
+			partsCount = &totalParts
+			if partNum > totalParts {
+				return nil, s3err.GetAPIError(s3err.ErrInvalidPartNumberRange)
+			}
+
+			// Parts holds cumulative sizes: Parts[i] = sum of sizes 1..i+1
+			if partNum > 1 {
+				startOffset = mpMeta.Parts[partNum-2]
+			}
+			length = mpMeta.Parts[partNum-1] - startOffset
+			contentRange = backend.GetPtrFromString(fmt.Sprintf("bytes %d-%d/%d", startOffset, startOffset+length-1, objSize))
+		} else if errors.Is(metaErr, meta.ErrNoSuchKey) {
+			// Non-multipart object: partNumber=1 means the whole object; anything
+			// higher is out of range
+			if *input.PartNumber > 1 {
+				return nil, s3err.GetAPIError(s3err.ErrInvalidPartNumberRange)
+			}
+			length = objSize
+			if objSize != 0 {
+				// if object size is 0, the whole object is served, no content range should be set
+				contentRange = backend.GetPtrFromString(fmt.Sprintf("bytes 0-%d/%d", objSize-1, objSize))
+			}
+		} else {
+			return nil, fmt.Errorf("retrieve mp metadata: %w", metaErr)
+		}
+	} else {
+		start, lgth, isValid, err := backend.ParseObjectRange(objSize, getString(input.Range))
+		if err != nil {
+			return nil, err
+		}
+		startOffset, length = start, lgth
+
+		if isValid {
+			contentRange = backend.GetPtrFromString(fmt.Sprintf("bytes %v-%v/%v", start, start+lgth-1, objSize))
+		}
 	}
 
 	objMeta := p.loadObjectMetaProperties(f, bucket, object, &fi)
@@ -4395,7 +4699,7 @@ func (p *Posix) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.Ge
 	}
 
 	var checksums s3response.Checksum
-	// Skip the checksums retreival if object isn't requested fully
+	// Return checksums only when the full object is requested
 	if input.ChecksumMode == types.ChecksumModeEnabled && length-startOffset == objSize {
 		checksums, err = p.retrieveChecksums(f, bucket, object)
 		if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
@@ -4423,7 +4727,7 @@ func (p *Posix) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.Ge
 		LastModified:       backend.GetTimePtr(fi.ModTime()),
 		Metadata:           objMeta.Metadata,
 		TagCount:           tagCount,
-		ContentRange:       &contentRange,
+		ContentRange:       contentRange,
 		StorageClass:       types.StorageClassStandard,
 		VersionId:          &versionId,
 		Body:               body,
@@ -4432,7 +4736,13 @@ func (p *Posix) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.Ge
 		ChecksumSHA1:       checksums.SHA1,
 		ChecksumSHA256:     checksums.SHA256,
 		ChecksumCRC64NVME:  checksums.CRC64NVME,
+		ChecksumSHA512:     checksums.SHA512,
+		ChecksumMD5:        checksums.MD5,
+		ChecksumXXHASH64:   checksums.XXHASH64,
+		ChecksumXXHASH3:    checksums.XXHASH3,
+		ChecksumXXHASH128:  checksums.XXHASH128,
 		ChecksumType:       checksums.Type,
+		PartsCount:         partsCount,
 	}, nil
 }
 
@@ -4450,11 +4760,6 @@ func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.
 
 	if err := p.validateVersionId(versionId); err != nil {
 		return nil, err
-	}
-
-	if input.PartNumber != nil {
-		// querying an object by part number is not supported
-		return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 
 	if !p.versioningEnabled() && versionId != "" {
@@ -4570,15 +4875,58 @@ func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.
 		size = 0
 	}
 
-	startOffset, length, isValid, err := backend.ParseObjectRange(size, getString(input.Range))
-	if err != nil {
-		return nil, err
-	}
+	var contentRange *string
+	var startOffset, length int64
+	var partsCount *int32
 
-	var contentRange string
-	if isValid {
-		contentRange = fmt.Sprintf("bytes %v-%v/%v",
-			startOffset, startOffset+length-1, size)
+	// If partNumber is requested and mp-metadata exists, serve that specific part.
+	// For non-multipart objects (no mp-metadata), partNumber=1 returns the full
+	// object with no Content-Range; any other partNumber is out of range.
+	// Both range read and partNumber can't be used together.
+	if input.PartNumber != nil {
+		mpMetaBytes, metaErr := p.meta.RetrieveAttribute(nil, bucket, object, mpMetaKey)
+		if metaErr == nil {
+			var mpMeta backend.MpUploadMetadata
+			if err := json.Unmarshal(mpMetaBytes, &mpMeta); err != nil {
+				return nil, fmt.Errorf("parse object multipart metadata: %w", err)
+			}
+
+			partNum := *input.PartNumber
+			totalParts := int32(len(mpMeta.Parts))
+			partsCount = &totalParts
+			if partNum > totalParts {
+				return nil, s3err.GetAPIError(s3err.ErrInvalidPartNumberRange)
+			}
+
+			// Parts holds cumulative sizes: Parts[i] = sum of sizes 1..i+1
+			if partNum > 1 {
+				startOffset = mpMeta.Parts[partNum-2]
+			}
+			length = mpMeta.Parts[partNum-1] - startOffset
+			contentRange = backend.GetPtrFromString(fmt.Sprintf("bytes %d-%d/%d", startOffset, startOffset+length-1, size))
+		} else if errors.Is(metaErr, meta.ErrNoSuchKey) {
+			// Non-multipart object: partNumber=1 means the whole object; anything
+			// higher is out of range
+			if *input.PartNumber > 1 {
+				return nil, s3err.GetAPIError(s3err.ErrInvalidPartNumberRange)
+			}
+			length = size
+			if length != 0 {
+				// if object size is 0, the whole object is served, no content range should be set
+				contentRange = backend.GetPtrFromString(fmt.Sprintf("bytes 0-%d/%d", length-1, length))
+			}
+		} else {
+			return nil, fmt.Errorf("retrieve mp metadata: %w", metaErr)
+		}
+	} else {
+		start, lgth, isValid, err := backend.ParseObjectRange(size, getString(input.Range))
+		if err != nil {
+			return nil, err
+		}
+		startOffset, length = start, lgth
+		if isValid {
+			contentRange = backend.GetPtrFromString(fmt.Sprintf("bytes %v-%v/%v", start, start+lgth-1, size))
+		}
 	}
 
 	var objectLockLegalHoldStatus types.ObjectLockLegalHoldStatus
@@ -4603,7 +4951,8 @@ func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.
 	}
 
 	var checksums s3response.Checksum
-	if input.ChecksumMode == types.ChecksumModeEnabled {
+	// Return checksums only when the full object is requested
+	if input.ChecksumMode == types.ChecksumModeEnabled && length-startOffset == size {
 		checksums, err = p.retrieveChecksums(nil, bucket, object)
 		if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
 			return nil, fmt.Errorf("get object checksums: %w", err)
@@ -4623,7 +4972,7 @@ func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.
 	return &s3.HeadObjectOutput{
 		ContentLength:             &length,
 		AcceptRanges:              backend.GetPtrFromString("bytes"),
-		ContentRange:              &contentRange,
+		ContentRange:              contentRange,
 		ContentType:               objMeta.ContentType,
 		ContentEncoding:           objMeta.ContentEncoding,
 		ContentDisposition:        objMeta.ContentDisposition,
@@ -4643,8 +4992,14 @@ func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.
 		ChecksumSHA1:              checksums.SHA1,
 		ChecksumSHA256:            checksums.SHA256,
 		ChecksumCRC64NVME:         checksums.CRC64NVME,
+		ChecksumSHA512:            checksums.SHA512,
+		ChecksumMD5:               checksums.MD5,
+		ChecksumXXHASH64:          checksums.XXHASH64,
+		ChecksumXXHASH3:           checksums.XXHASH3,
+		ChecksumXXHASH128:         checksums.XXHASH128,
 		ChecksumType:              checksums.Type,
 		TagCount:                  tagCount,
+		PartsCount:                partsCount,
 	}, nil
 }
 
@@ -4685,6 +5040,11 @@ func (p *Posix) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAttr
 			ChecksumSHA1:      data.ChecksumSHA1,
 			ChecksumSHA256:    data.ChecksumSHA256,
 			ChecksumCRC64NVME: data.ChecksumCRC64NVME,
+			ChecksumSHA512:    data.ChecksumSHA512,
+			ChecksumMD5:       data.ChecksumMD5,
+			ChecksumXXHASH64:  data.ChecksumXXHASH64,
+			ChecksumXXHASH3:   data.ChecksumXXHASH3,
+			ChecksumXXHASH128: data.ChecksumXXHASH128,
 			ChecksumType:      data.ChecksumType,
 		},
 	}, nil
@@ -4831,6 +5191,11 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 	var sha1 *string
 	var sha256 *string
 	var crc64nvme *string
+	var sha512 *string
+	var md5sum *string
+	var xxhash64 *string
+	var xxhash3 *string
+	var xxhash128 *string
 	var chType types.ChecksumType
 
 	dstObjdPath := joinPathWithTrailer(dstBucket, dstObject)
@@ -4891,6 +5256,21 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 				case utils.HashTypeCRC64NVME:
 					checksums.CRC64NVME = &sum
 					crc64nvme = &sum
+				case utils.HashTypeSha512:
+					checksums.SHA512 = &sum
+					sha512 = &sum
+				case utils.HashTypeMd5:
+					checksums.MD5 = &sum
+					md5sum = &sum
+				case utils.HashTypeXXHASH64:
+					checksums.XXHASH64 = &sum
+					xxhash64 = &sum
+				case utils.HashTypeXXHASH3:
+					checksums.XXHASH3 = &sum
+					xxhash3 = &sum
+				case utils.HashTypeXXHASH128:
+					checksums.XXHASH128 = &sum
+					xxhash128 = &sum
 				}
 
 				// If a new checksum is calculated, the checksum type
@@ -5014,6 +5394,11 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 		sha1 = res.ChecksumSHA1
 		sha256 = res.ChecksumSHA256
 		crc64nvme = res.ChecksumCRC64NVME
+		sha512 = res.ChecksumSHA512
+		md5sum = res.ChecksumMD5
+		xxhash64 = res.ChecksumXXHASH64
+		xxhash3 = res.ChecksumXXHASH3
+		xxhash128 = res.ChecksumXXHASH128
 		chType = res.ChecksumType
 	}
 
@@ -5031,6 +5416,11 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 			ChecksumSHA1:      sha1,
 			ChecksumSHA256:    sha256,
 			ChecksumCRC64NVME: crc64nvme,
+			ChecksumSHA512:    sha512,
+			ChecksumMD5:       md5sum,
+			ChecksumXXHASH64:  xxhash64,
+			ChecksumXXHASH3:   xxhash3,
+			ChecksumXXHASH128: xxhash128,
 			ChecksumType:      chType,
 		},
 		VersionId:           version,
@@ -5429,6 +5819,19 @@ func (p *Posix) GetObjectTagging(ctx context.Context, bucket, object, versionId 
 		return nil, err
 	}
 
+	if versionId == "" {
+		_, err = os.Stat(filepath.Join(bucket, object))
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		}
+		if errors.Is(err, syscall.ENAMETOOLONG) {
+			return nil, s3err.GetAPIError(s3err.ErrKeyTooLong)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("stat object: %w", err)
+		}
+	}
+
 	if versionId != "" {
 		if !p.versioningEnabled() {
 			//TODO: Maybe we need to return our custom error here?
@@ -5504,6 +5907,19 @@ func (p *Posix) PutObjectTagging(ctx context.Context, bucket, object, versionId 
 
 	if err := p.validateVersionId(versionId); err != nil {
 		return err
+	}
+
+	if versionId == "" {
+		_, err = os.Stat(filepath.Join(bucket, object))
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return s3err.GetAPIError(s3err.ErrNoSuchKey)
+		}
+		if errors.Is(err, syscall.ENAMETOOLONG) {
+			return s3err.GetAPIError(s3err.ErrKeyTooLong)
+		}
+		if err != nil {
+			return fmt.Errorf("stat object: %w", err)
+		}
 	}
 
 	if versionId != "" {

@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -37,8 +38,15 @@ func VerifyObjectCopyAccess(ctx context.Context, be backend.Backend, copySource 
 	if err := VerifyAccess(ctx, be, opts); err != nil {
 		return err
 	}
-	// Verify source bucket access
-	srcBucket, srcObject, found := strings.Cut(copySource, "/")
+	// Verify source bucket access.
+	// URL-decode the copy source before splitting so that clients which send
+	// the bucket/key separator as "%2F" are handled correctly.
+	// Callers are expected to have already stripped any leading '/'.
+	decodedSrc, err := url.QueryUnescape(copySource)
+	if err != nil {
+		return s3err.GetAPIError(s3err.ErrInvalidCopySourceEncoding)
+	}
+	srcBucket, srcObject, found := strings.Cut(decodedSrc, "/")
 	if !found {
 		return s3err.GetAPIError(s3err.ErrInvalidCopySourceBucket)
 	}
@@ -61,7 +69,7 @@ func VerifyObjectCopyAccess(ctx context.Context, be backend.Backend, copySource 
 		Acc:           opts.Acc,
 		Bucket:        srcBucket,
 		Object:        srcObject,
-		Action:        GetObjectAction,
+		Actions:       []Action{GetObjectAction},
 	}); err != nil {
 		return err
 	}
@@ -76,7 +84,7 @@ type AccessOptions struct {
 	Acc             Account
 	Bucket          string
 	Object          string
-	Action          Action
+	Actions         []Action
 	Readonly        bool
 	IsPublicRequest bool
 	DisableACL      bool
@@ -105,7 +113,7 @@ func VerifyAccess(ctx context.Context, be backend.Backend, opts AccessOptions) e
 			return policyErr
 		}
 	} else {
-		return VerifyBucketPolicy(policy, opts.Acc.Access, opts.Bucket, opts.Object, opts.Action)
+		return VerifyBucketPolicy(policy, opts.Acc.Access, opts.Bucket, opts.Object, opts.Actions...)
 	}
 
 	if err := verifyACL(opts.Acl, opts.Acc.Access, opts.AclPermission, opts.DisableACL); err != nil {

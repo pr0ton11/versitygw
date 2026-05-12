@@ -81,6 +81,8 @@ const (
 	ErrInvalidObjectAttributes
 	ErrInvalidPart
 	ErrInvalidPartNumber
+	ErrInvalidPartNumberRange
+	ErrRangeAndPartNumber
 	ErrInvalidPartOrder
 	ErrInvalidCompleteMpPartNumber
 	ErrInternalError
@@ -192,6 +194,7 @@ const (
 	ErrMetadataTooLarge
 	ErrOnlyAws4HmacSha256
 	ErrInvalidDateHeader
+	ErrUnsupportedAuthorizationMechanism
 
 	// Non-AWS errors
 	ErrExistingObjectIsDirectory
@@ -201,6 +204,7 @@ const (
 	ErrQuotaExceeded
 	ErrVersioningNotConfigured
 	ErrACLsDisabled
+	ErrNoSpaceLeftOnDevice
 
 	// Admin api errors
 	ErrAdminAccessDenied
@@ -341,6 +345,16 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	ErrInvalidPartNumber: {
 		Code:           "InvalidArgument",
 		Description:    "Part number must be an integer between 1 and 10000, inclusive.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidPartNumberRange: {
+		Code:           "InvalidPartNumber",
+		Description:    "The requested partnumber is not satisfiable.",
+		HTTPStatusCode: http.StatusRequestedRangeNotSatisfiable,
+	},
+	ErrRangeAndPartNumber: {
+		Code:           "InvalidRequest",
+		Description:    "Cannot specify both Range header and partNumber query parameter",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrInvalidPartOrder: {
@@ -755,7 +769,7 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	},
 	ErrInvalidChecksumAlgorithm: {
 		Code:           "InvalidRequest",
-		Description:    "Checksum algorithm provided is unsupported. Please try again with any of the valid types: [CRC32, CRC32C, SHA1, SHA256]",
+		Description:    "Checksum algorithm provided is unsupported. Please try again with any of the valid types: [CRC32, CRC32C, CRC64NVME, MD5, SHA1, SHA256, SHA512, XXHASH128, XXHASH3, XXHASH64]",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrInvalidChecksumPart: {
@@ -879,6 +893,11 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "X-Amz-Date must be formated via ISO8601 Long format",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrUnsupportedAuthorizationMechanism: {
+		Code:           "InvalidRequest",
+		Description:    "The authorization mechanism you have provided is not supported. Please use AWS4-HMAC-SHA256.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 
 	// non aws errors
 	ErrExistingObjectIsDirectory: {
@@ -915,6 +934,11 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Code:           "AccessControlListNotSupported",
 		Description:    "Access control lists are disabled at the gateway level",
 		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrNoSpaceLeftOnDevice: {
+		Code:           "InsufficientStorage",
+		Description:    "No space left on device.",
+		HTTPStatusCode: http.StatusInsufficientStorage,
 	},
 
 	// Admin api errors

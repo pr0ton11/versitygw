@@ -20,7 +20,7 @@ calculate_multipart_checksum() {
   fi
   log 5 "checksums: ${*:4}"
   if [ "$1" == "COMPOSITE" ]; then
-    if ! calculate_composite_checksum "$lowercase_checksum_algorithm" ${@:4}; then
+    if ! calculate_composite_checksum "$lowercase_checksum_algorithm" "${@:4}"; then
       log 2 "error calculating checksum"
       return 1
     fi
@@ -51,7 +51,7 @@ complete_multipart_upload_with_checksum() {
   fi
   log 5 "parts payload: $parts_payload"
   log 5 "checksums: ${checksums[*]}"
-  if ! calculate_multipart_checksum "$6" "$5" "$3" ${checksums[@]}; then
+  if ! calculate_multipart_checksum "$6" "$5" "$3" "${checksums[@]}"; then
     log 2 "error calculating multipart checksum"
     return 1
   fi
@@ -76,7 +76,7 @@ calculate_composite_checksum() {
     return 1
   fi
   log 5 "checksums: ${*:2}"
-  for checksum in ${@:2}; do
+  for checksum in "${@:2}"; do
     if ! printf '%s' "$checksum" | base64 -d >> "$TEST_FILE_FOLDER/all_checksums.bin"; then
       log 2 "error calculating binary checksum and adding to file"
       return 1
@@ -113,7 +113,7 @@ test_multipart_upload_with_checksum() {
     log 2 "error performing multipart upload with checksum before completion"
     return 1
   fi
-  if ! calculate_multipart_checksum "$1" 2 "$TEST_FILE_FOLDER/$mp_file_name" ${checksums[@]}; then
+  if ! calculate_multipart_checksum "$1" 2 "$TEST_FILE_FOLDER/$mp_file_name" "${checksums[@]}"; then
     log 2 "error calculating multipart checksum"
     return 1
   fi
@@ -158,7 +158,7 @@ test_complete_multipart_upload_incorrect_checksum() {
     log 2 "error performing multipart upload with checksum before completion"
     return 1
   fi
-  if ! calculate_multipart_checksum "$1" 2 "$TEST_FILE_FOLDER/$mp_file_name" ${checksums[@]}; then
+  if ! calculate_multipart_checksum "$1" 2 "$TEST_FILE_FOLDER/$mp_file_name" "${checksums[@]}"; then
     log 2 "error calculating multipart checksum"
     return 1
   fi
@@ -210,32 +210,7 @@ perform_multipart_upload_rest() {
   if  ! check_param_count_v2 "bucket, key, four parts" 6 $#; then
     return 1
   fi
-  if ! upload_id=$(create_multipart_upload_rest "$1" "$2" "" "parse_upload_id" 2>&1); then
-    log 2 "error creating multipart upload: $upload_id"
-    return 1
-  fi
-  if ! etag=$(upload_part_rest "$1" "$2" "$upload_id" 1 "$3" 2>&1); then
-    log 2 "error uploading part 1"
-    return 1
-  fi
-  parts_payload="<Part><ETag>$etag</ETag><PartNumber>1</PartNumber></Part>"
-  if ! etag=$(upload_part_rest "$1" "$2" "$upload_id" 2 "$4" 2>&1); then
-    log 2 "error uploading part 2: $etag"
-    return 1
-  fi
-  parts_payload+="<Part><ETag>$etag</ETag><PartNumber>2</PartNumber></Part>"
-  if ! etag=$(upload_part_rest "$1" "$2" "$upload_id" 3 "$5" 2>&1); then
-    log 2 "error uploading part 3: $etag"
-    return 1
-  fi
-  parts_payload+="<Part><ETag>$etag</ETag><PartNumber>3</PartNumber></Part>"
-  if ! etag=$(upload_part_rest "$1" "$2" "$upload_id" 4 "$6" 2>&1); then
-    log 2 "error uploading part 4: $etag"
-    return 1
-  fi
-  parts_payload+="<Part><ETag>$etag</ETag><PartNumber>4</PartNumber></Part>"
-  if ! complete_multipart_upload_rest "$1" "$2" "$upload_id" "$parts_payload"; then
-    log 2 "error completing multipart upload"
+  if ! perform_multipart_upload_rest_variable_parts "$@"; then
     return 1
   fi
   return 0
@@ -258,6 +233,37 @@ upload_check_parts() {
     return 1
   fi
   log 5 "PARTS PAYLOAD:  $parts_payload"
+  if ! complete_multipart_upload_rest "$1" "$2" "$upload_id" "$parts_payload"; then
+    log 2 "error completing multipart upload"
+    return 1
+  fi
+  return 0
+}
+
+perform_multipart_upload_rest_variable_parts() {
+  if ! check_param_count_gt "bucket, key, at least two part locations" 4 $#; then
+    return 1
+  fi
+  local response
+
+  if ! response=$(create_multipart_upload_rest "$1" "$2" "" "parse_upload_id" 2>&1); then
+    log 2 "error creating multipart upload: $response"
+    return 1
+  fi
+  upload_id="$response"
+
+  local parts_payload="" idx=1
+  for part in "${@:3}"; do
+    if ! response=$(upload_part_rest "$1" "$2" "$upload_id" "$idx" "$part" 2>&1); then
+      log 2 "error uploading part $idx: $response"
+      return 1
+    fi
+    etag="$response"
+    parts_payload+="<Part><ETag>$etag</ETag><PartNumber>$idx</PartNumber></Part>"
+    idx=$((idx+1))
+  done
+  log 5 "final payload: $parts_payload"
+
   if ! complete_multipart_upload_rest "$1" "$2" "$upload_id" "$parts_payload"; then
     log 2 "error completing multipart upload"
     return 1

@@ -73,6 +73,10 @@ const (
 	// keyMpZeroBytesParts tracks zero-byte upload parts in the sgwtmp metadata.
 	// Azure StageBlock rejects Content-Length: 0, so zero-byte parts are stored here.
 	keyMpZeroBytesParts key = "Zerobytesparts"
+	// keyMpMetadata stores multipart upload part-offset metadata on the final
+	// committed blob so that GetObject/HeadObject can serve individual parts
+	// by part-number.
+	keyMpMetadata key = "Mpmetadata"
 
 	defaultListingMaxKeys = 1000
 )
@@ -89,6 +93,7 @@ func (key) Table() map[string]struct{} {
 		"objectlegalhold":   {},
 		"objname":           {},
 		".sgwtmp/multipart": {},
+		"mpmetadata":        {},
 	}
 }
 
@@ -304,15 +309,21 @@ func (az *Azure) HeadBucket(ctx context.Context, input *s3.HeadBucketInput) (*s3
 func (az *Azure) DeleteBucket(ctx context.Context, bucket string) error {
 	pager := az.client.NewListBlobsFlatPager(bucket, nil)
 
-	pg, err := pager.NextPage(ctx)
-	if err != nil {
-		return azureErrToS3Err(err)
+	for pager.More() {
+		pg, err := pager.NextPage(ctx)
+		if err != nil {
+			return azureErrToS3Err(err)
+		}
+
+		for _, item := range pg.Segment.BlobItems {
+			// ignore temp multipart objects when determining if bucket non-empty
+			if !strings.HasPrefix(backend.GetStringFromPtr(item.Name), string(metaTmpMultipartPrefix)) {
+				return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
+			}
+		}
 	}
 
-	if len(pg.Segment.BlobItems) > 0 {
-		return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
-	}
-	_, err = az.client.DeleteContainer(ctx, bucket, nil)
+	_, err := az.client.DeleteContainer(ctx, bucket, nil)
 	return azureErrToS3Err(err)
 }
 
@@ -457,11 +468,6 @@ func (az *Azure) DeleteBucketTagging(ctx context.Context, bucket string) error {
 }
 
 func (az *Azure) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
-	if input.PartNumber != nil {
-		// querying an object with part number is not supported
-		return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
-	}
-
 	client, err := az.getBlobClient(*input.Bucket, *input.Key)
 	if err != nil {
 		return nil, err
@@ -485,9 +491,60 @@ func (az *Azure) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 		}
 	}
 
+	var objSize int64
+	if resp.ContentLength != nil {
+		objSize = *resp.ContentLength
+	}
+
 	var opts *azblob.DownloadStreamOptions
-	if *input.Range != "" {
-		offset, count, isValid, err := backend.ParseObjectRange(*resp.ContentLength, *input.Range)
+	var partsCount *int32
+	var contentRange *string
+
+	if input.PartNumber != nil {
+		// Serve a specific part if the object has multipart upload metadata.
+		// For non-multipart objects (no mp-metadata), partNumber=1 returns the
+		// full object with no Content-Range; any other partNumber is out of range.
+		if mpMetaStr, ok := resp.Metadata[string(keyMpMetadata)]; ok && mpMetaStr != nil {
+			var mpMeta backend.MpUploadMetadata
+			if err := json.Unmarshal([]byte(*mpMetaStr), &mpMeta); err != nil {
+				return nil, fmt.Errorf("parse object multipart metadata: %w", err)
+			}
+
+			partNum := *input.PartNumber
+			totalParts := int32(len(mpMeta.Parts))
+			partsCount = &totalParts
+			if partNum > totalParts {
+				return nil, s3err.GetAPIError(s3err.ErrInvalidPartNumberRange)
+			}
+
+			var startOffset int64
+			if partNum > 1 {
+				startOffset = mpMeta.Parts[partNum-2]
+			}
+			length := mpMeta.Parts[partNum-1] - startOffset
+			var objSize int64
+			if resp.ContentLength != nil {
+				objSize = *resp.ContentLength
+			}
+			contentRange = backend.GetPtrFromString(fmt.Sprintf("bytes %d-%d/%d", startOffset, startOffset+length-1, objSize))
+			opts = &azblob.DownloadStreamOptions{
+				Range: blob.HTTPRange{
+					Offset: startOffset,
+					Count:  length,
+				},
+			}
+		} else if *input.PartNumber > 1 {
+			return nil, s3err.GetAPIError(s3err.ErrInvalidPartNumberRange)
+		} else {
+			// partNumber=1 on a non-multipart object: fall through and serve the
+			// full object without a range (opts remains nil)
+			if objSize != 0 {
+				// if object size is 0, the whole object is served, no content range should be set
+				contentRange = backend.GetPtrFromString(fmt.Sprintf("bytes 0-%d/%d", objSize-1, objSize))
+			}
+		}
+	} else if *input.Range != "" {
+		offset, count, isValid, err := backend.ParseObjectRange(objSize, *input.Range)
 		if err != nil {
 			return nil, err
 		}
@@ -498,8 +555,10 @@ func (az *Azure) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 					Offset: offset,
 				},
 			}
+			contentRange = backend.GetPtrFromString(fmt.Sprintf("bytes %v-%v/%v", offset, offset+count-1, objSize))
 		}
 	}
+
 	blobDownloadResponse, err := az.client.DownloadStream(ctx, *input.Bucket, *input.Key, opts)
 	if err != nil {
 		return nil, azureErrToS3Err(err)
@@ -523,18 +582,14 @@ func (az *Azure) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 		LastModified:       blobDownloadResponse.LastModified,
 		Metadata:           parseAndFilterAzMetadata(blobDownloadResponse.Metadata),
 		TagCount:           &tagcount,
-		ContentRange:       blobDownloadResponse.ContentRange,
+		ContentRange:       contentRange,
 		Body:               blobDownloadResponse.Body,
 		StorageClass:       types.StorageClassStandard,
+		PartsCount:         partsCount,
 	}, nil
 }
 
 func (az *Azure) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
-	if input.PartNumber != nil {
-		// querying an object with part number is not supported
-		return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
-	}
-
 	client, err := az.getBlobClient(*input.Bucket, *input.Key)
 	if err != nil {
 		return nil, err
@@ -563,21 +618,61 @@ func (az *Azure) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3
 		size = *resp.ContentLength
 	}
 
-	startOffset, length, isValid, err := backend.ParseObjectRange(size, getString(input.Range))
-	if err != nil {
-		return nil, err
-	}
+	var contentRange *string
+	var length int64
+	var partsCount *int32
 
-	var contentRange string
-	if isValid {
-		contentRange = fmt.Sprintf("bytes %v-%v/%v",
-			startOffset, startOffset+length-1, size)
+	if input.PartNumber != nil {
+		// Serve a specific part if the object has multipart upload metadata.
+		// For non-multipart objects (no mp-metadata), partNumber=1 returns the
+		// full object with no Content-Range; any other partNumber is out of range.
+		if mpMetaStr, ok := resp.Metadata[string(keyMpMetadata)]; ok && mpMetaStr != nil {
+			var mpMeta backend.MpUploadMetadata
+			if err := json.Unmarshal([]byte(*mpMetaStr), &mpMeta); err != nil {
+				return nil, fmt.Errorf("parse object multipart metadata: %w", err)
+			}
+
+			partNum := *input.PartNumber
+			totalParts := int32(len(mpMeta.Parts))
+			partsCount = &totalParts
+			if partNum > totalParts {
+				return nil, s3err.GetAPIError(s3err.ErrInvalidPartNumberRange)
+			}
+
+			var startOffset int64
+			if partNum > 1 {
+				startOffset = mpMeta.Parts[partNum-2]
+			}
+			length = mpMeta.Parts[partNum-1] - startOffset
+			contentRange = backend.GetPtrFromString(fmt.Sprintf("bytes %d-%d/%d", startOffset, startOffset+length-1, size))
+		} else if *input.PartNumber > 1 {
+			return nil, s3err.GetAPIError(s3err.ErrInvalidPartNumberRange)
+		} else {
+			// partNumber=1 on a non-multipart object: return full object size,
+			// no Content-Range, no PartsCount.
+			length = size
+			if length != 0 {
+				// if object size is 0, the whole object is served, no content range should be set
+				contentRange = backend.GetPtrFromString(fmt.Sprintf("bytes 0-%d/%d", size-1, size))
+			}
+		}
+	} else {
+		startOffset, lgth, isValid, err := backend.ParseObjectRange(size, getString(input.Range))
+		if err != nil {
+			return nil, err
+		}
+		length = lgth
+		if isValid {
+			contentRange = backend.GetPtrFromString(fmt.Sprintf("bytes %v-%v/%v",
+				startOffset, startOffset+length-1, size))
+		}
 	}
 
 	result := &s3.HeadObjectOutput{
-		ContentRange:       &contentRange,
+		ContentRange:       contentRange,
 		AcceptRanges:       backend.GetPtrFromString("bytes"),
 		ContentLength:      &length,
+		PartsCount:         partsCount,
 		ContentType:        resp.ContentType,
 		ContentEncoding:    resp.ContentEncoding,
 		ContentLanguage:    resp.ContentLanguage,
@@ -659,92 +754,124 @@ func (az *Azure) ListObjects(ctx context.Context, input *s3.ListObjectsInput) (s
 		maxKeys = *input.MaxKeys
 	}
 
-	pager := client.NewListBlobsHierarchyPager(*input.Delimiter, &container.ListBlobsHierarchyOptions{
-		MaxResults: &maxKeys,
-		Prefix:     input.Prefix,
+	delimiter := backend.GetStringFromPtr(input.Delimiter)
+	prefix := backend.GetStringFromPtr(input.Prefix)
+	effectiveMarker := backend.GetStringFromPtr(input.Marker)
+
+	if maxKeys == 0 {
+		isFalse := false
+		return s3response.ListObjectsResult{
+			IsTruncated:    &isFalse,
+			MaxKeys:        &maxKeys,
+			Name:           input.Bucket,
+			Prefix:         backend.GetPtrFromString(prefix),
+			Marker:         backend.GetPtrFromString(effectiveMarker),
+			Delimiter:      backend.GetPtrFromString(delimiter),
+			CommonPrefixes: []types.CommonPrefix{},
+		}, nil
+	}
+
+	// Use flat listing (empty delimiter) and handle delimiter logic client-side,
+	// matching S3 semantics. Only pass Prefix and Marker to Azure.
+	pager := client.NewListBlobsHierarchyPager("", &container.ListBlobsHierarchyOptions{
+		Prefix: input.Prefix,
+		Marker: input.Marker,
 	})
 
 	var objects []s3response.Object
 	var cPrefixes []types.CommonPrefix
-	var nextMarker *string
-	var isTruncated bool
+	cpSet := make(map[string]struct{})
+	var pastMax, isTruncated bool
+	var candidateMarker string
+	var totalFound int32
 
-	// Convert marker to filter criteria
-	var markerFilter string
-	if input.Marker != nil && *input.Marker != "" {
-		markerFilter = *input.Marker
-	}
-
-	// Loop through pages until we have enough objects or no more pages
-	objectsFound := int32(0)
-	for pager.More() && objectsFound < maxKeys {
+loop:
+	for pager.More() {
 		resp, err := pager.NextPage(ctx)
 		if err != nil {
 			return s3response.ListObjectsResult{}, azureErrToS3Err(err)
 		}
 
-		// Process objects from this page
-		var pageObjects []s3response.Object
 		for _, v := range resp.Segment.BlobItems {
-			// Skip objects that come before or equal to marker
-			if markerFilter != "" && *v.Name <= markerFilter {
+			name := backend.GetStringFromPtr(v.Name)
+
+			// Filter out multipart upload blobs
+			if strings.HasPrefix(name, string(metaTmpMultipartPrefix)) {
 				continue
 			}
 
-			pageObjects = append(pageObjects, s3response.Object{
-				ETag:         backend.GetPtrFromString(convertAzureEtag(v.Properties.ETag)),
-				Key:          v.Name,
-				LastModified: v.Properties.LastModified,
-				Size:         v.Properties.ContentLength,
-				StorageClass: types.ObjectStorageClassStandard,
-				Owner: &types.Owner{
-					ID: &acl.Owner,
-				},
-			})
-
-			objectsFound++
-			if objectsFound >= maxKeys {
-				// Set next marker to the current object name for pagination
-				nextMarker = v.Name
-				isTruncated = true
-				break
-			}
-		}
-
-		objects = append(objects, pageObjects...)
-
-		// Process common prefixes from this page
-		for _, v := range resp.Segment.BlobPrefixes {
-			// Skip prefixes that come before or equal to marker
-			if markerFilter != "" && *v.Name <= markerFilter {
-				continue
+			// Apply delimiter logic to determine if this blob contributes to
+			// a common prefix or is a regular object
+			isCP := false
+			cpKey := ""
+			if delimiter != "" {
+				suffix := strings.TrimPrefix(name, prefix)
+				before, _, found := strings.Cut(suffix, delimiter)
+				if found {
+					isCP = true
+					cpKey = prefix + before + delimiter
+				}
 			}
 
-			cPrefixes = append(cPrefixes, types.CommonPrefix{
-				Prefix: v.Name,
-			})
+			if isCP {
+				// Skip common prefixes at or before the marker
+				if cpKey <= effectiveMarker {
+					continue
+				}
+				// Deduplicate: multiple blobs can map to the same common prefix
+				if _, exists := cpSet[cpKey]; exists {
+					continue
+				}
+				// If we already reached maxKeys, this new unique CP means truncation
+				if pastMax {
+					isTruncated = true
+					break loop
+				}
+				cp := cpKey
+				cPrefixes = append(cPrefixes, types.CommonPrefix{Prefix: &cp})
+				cpSet[cpKey] = struct{}{}
+				candidateMarker = cpKey
+				totalFound++
+				if totalFound == maxKeys {
+					pastMax = true
+				}
+			} else {
+				if pastMax {
+					isTruncated = true
+					break loop
+				}
+				objects = append(objects, s3response.Object{
+					ETag:         backend.GetPtrFromString(convertAzureEtag(v.Properties.ETag)),
+					Key:          v.Name,
+					LastModified: v.Properties.LastModified,
+					Size:         v.Properties.ContentLength,
+					StorageClass: types.ObjectStorageClassStandard,
+					Owner: &types.Owner{
+						ID: &acl.Owner,
+					},
+				})
+				candidateMarker = name
+				totalFound++
+				if totalFound == maxKeys {
+					pastMax = true
+				}
+			}
 		}
+	}
 
-		// If we've reached maxKeys, break
-		if objectsFound >= maxKeys {
-			break
-		}
-
-		// If Azure indicates more pages but we need to continue for more objects
-		if resp.NextMarker != nil && *resp.NextMarker != "" && objectsFound < maxKeys {
-			continue
-		}
+	if !isTruncated {
+		candidateMarker = ""
 	}
 
 	return s3response.ListObjectsResult{
 		Contents:       objects,
-		Marker:         backend.GetPtrFromString(*input.Marker),
-		MaxKeys:        input.MaxKeys,
+		Marker:         backend.GetPtrFromString(effectiveMarker),
+		MaxKeys:        &maxKeys,
 		Name:           input.Bucket,
-		NextMarker:     nextMarker,
-		Prefix:         backend.GetPtrFromString(*input.Prefix),
+		NextMarker:     backend.GetPtrFromString(candidateMarker),
+		Prefix:         backend.GetPtrFromString(prefix),
 		IsTruncated:    &isTruncated,
-		Delimiter:      backend.GetPtrFromString(*input.Delimiter),
+		Delimiter:      backend.GetPtrFromString(delimiter),
 		CommonPrefixes: cPrefixes,
 	}, nil
 }
@@ -772,95 +899,139 @@ func (az *Azure) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Input
 		maxKeys = *input.MaxKeys
 	}
 
-	pager := client.NewListBlobsHierarchyPager(*input.Delimiter, &container.ListBlobsHierarchyOptions{
-		Marker:     input.ContinuationToken,
-		MaxResults: &maxKeys,
-		Prefix:     input.Prefix,
+	delimiter := backend.GetStringFromPtr(input.Delimiter)
+	prefix := backend.GetStringFromPtr(input.Prefix)
+	startAfterVal := backend.GetStringFromPtr(input.StartAfter)
+	continuationTokenVal := backend.GetStringFromPtr(input.ContinuationToken)
+
+	// Take the lexicographically larger of startAfter and continuationToken so
+	// listing starts strictly after both constraints.
+	effectiveMarker := startAfterVal
+	if continuationTokenVal > effectiveMarker {
+		effectiveMarker = continuationTokenVal
+	}
+
+	if maxKeys == 0 {
+		isFalse := false
+		return s3response.ListObjectsV2Result{
+			IsTruncated:       &isFalse,
+			MaxKeys:           &maxKeys,
+			Name:              input.Bucket,
+			Prefix:            backend.GetPtrFromString(prefix),
+			ContinuationToken: backend.GetPtrFromString(continuationTokenVal),
+			Delimiter:         backend.GetPtrFromString(delimiter),
+			StartAfter:        backend.GetPtrFromString(startAfterVal),
+			CommonPrefixes:    []types.CommonPrefix{},
+		}, nil
+	}
+
+	// Use flat listing (empty delimiter) and handle delimiter logic client-side,
+	// matching S3 semantics. Only pass Prefix and Marker to Azure.
+	// effectiveMarker is passed as Marker so Azure skips blobs before it.
+	pager := client.NewListBlobsHierarchyPager("", &container.ListBlobsHierarchyOptions{
+		Prefix: input.Prefix,
+		Marker: backend.GetPtrFromString(effectiveMarker),
 	})
 
 	var objects []s3response.Object
-	var resp container.ListBlobsHierarchyResponse
+	var cPrefixes []types.CommonPrefix
+	cpSet := make(map[string]struct{})
+	var pastMax, isTruncated bool
+	var candidateMarker string
+	var totalFound int32
 
-	// Loop through pages until we find objects or no more pages
-	for {
-		resp, err = pager.NextPage(ctx)
+loop:
+	for pager.More() {
+		resp, err := pager.NextPage(ctx)
 		if err != nil {
 			return s3response.ListObjectsV2Result{}, azureErrToS3Err(err)
 		}
 
-		// Convert Azure objects to S3 objects
-		var pageObjects []s3response.Object
 		for _, v := range resp.Segment.BlobItems {
-			pageObjects = append(pageObjects, s3response.Object{
-				ETag:         backend.GetPtrFromString(convertAzureEtag(v.Properties.ETag)),
-				Key:          v.Name,
-				LastModified: v.Properties.LastModified,
-				Size:         v.Properties.ContentLength,
-				StorageClass: types.ObjectStorageClassStandard,
-				Owner: &types.Owner{
-					ID: &acl.Owner,
-				},
-			})
-		}
+			name := backend.GetStringFromPtr(v.Name)
 
-		// If StartAfter is specified, filter objects
-		if input.StartAfter != nil && *input.StartAfter != "" {
-			startAfter := *input.StartAfter
-			startIndex := -1
-			for i, obj := range pageObjects {
-				if *obj.Key > startAfter {
-					startIndex = i
-					break
-				}
-			}
-
-			if startIndex != -1 {
-				// Found objects after StartAfter in this page
-				objects = append(objects, pageObjects[startIndex:]...)
-				break
-			} else {
-				// No objects after StartAfter in this page
-				// Check if there are more pages to examine
-				if resp.NextMarker == nil || *resp.NextMarker == "" {
-					// No more pages, so no objects after StartAfter
-					break
-				}
-				// Continue to next page without adding any objects
+			// Filter out multipart upload blobs
+			if strings.HasPrefix(name, string(metaTmpMultipartPrefix)) {
 				continue
 			}
-		} else {
-			// No StartAfter specified, add all objects from this page
-			objects = append(objects, pageObjects...)
-			break
+
+			// Apply delimiter logic to determine if this blob contributes to
+			// a common prefix or is a regular object
+			isCP := false
+			cpKey := ""
+			if delimiter != "" {
+				suffix := strings.TrimPrefix(name, prefix)
+				before, _, found := strings.Cut(suffix, delimiter)
+				if found {
+					isCP = true
+					cpKey = prefix + before + delimiter
+				}
+			}
+
+			if isCP {
+				// Skip common prefixes at or before the effective marker
+				if cpKey <= effectiveMarker {
+					continue
+				}
+				// Deduplicate: multiple blobs can map to the same common prefix
+				if _, exists := cpSet[cpKey]; exists {
+					continue
+				}
+				// If we already reached maxKeys, this new unique CP means truncation
+				if pastMax {
+					isTruncated = true
+					break loop
+				}
+				cp := cpKey
+				cPrefixes = append(cPrefixes, types.CommonPrefix{Prefix: &cp})
+				cpSet[cpKey] = struct{}{}
+				candidateMarker = cpKey
+				totalFound++
+				if totalFound == maxKeys {
+					pastMax = true
+				}
+			} else {
+				if pastMax {
+					isTruncated = true
+					break loop
+				}
+				objects = append(objects, s3response.Object{
+					ETag:         backend.GetPtrFromString(convertAzureEtag(v.Properties.ETag)),
+					Key:          v.Name,
+					LastModified: v.Properties.LastModified,
+					Size:         v.Properties.ContentLength,
+					StorageClass: types.ObjectStorageClassStandard,
+					Owner: &types.Owner{
+						ID: &acl.Owner,
+					},
+				})
+				candidateMarker = name
+				totalFound++
+				if totalFound == maxKeys {
+					pastMax = true
+				}
+			}
 		}
 	}
 
-	var cPrefixes []types.CommonPrefix
-	for _, v := range resp.Segment.BlobPrefixes {
-		cPrefixes = append(cPrefixes, types.CommonPrefix{
-			Prefix: v.Name,
-		})
+	if !isTruncated {
+		candidateMarker = ""
 	}
 
-	var isTruncated bool
-	var nextMarker *string
-	// If Azure returned a NextMarker, set it for the next request
-	if resp.NextMarker != nil && *resp.NextMarker != "" {
-		nextMarker = resp.NextMarker
-		isTruncated = true
-	}
+	keyCount := int32(len(objects) + len(cPrefixes))
 
 	return s3response.ListObjectsV2Result{
 		Contents:              objects,
-		ContinuationToken:     backend.GetPtrFromString(*input.ContinuationToken),
-		MaxKeys:               input.MaxKeys,
+		ContinuationToken:     backend.GetPtrFromString(continuationTokenVal),
+		KeyCount:              &keyCount,
+		MaxKeys:               &maxKeys,
 		Name:                  input.Bucket,
-		NextContinuationToken: nextMarker,
-		Prefix:                backend.GetPtrFromString(*input.Prefix),
+		NextContinuationToken: backend.GetPtrFromString(candidateMarker),
+		Prefix:                backend.GetPtrFromString(prefix),
 		IsTruncated:           &isTruncated,
-		Delimiter:             backend.GetPtrFromString(*input.Delimiter),
+		Delimiter:             backend.GetPtrFromString(delimiter),
 		CommonPrefixes:        cPrefixes,
-		StartAfter:            backend.GetPtrFromString(*input.StartAfter),
+		StartAfter:            backend.GetPtrFromString(startAfterVal),
 	}, nil
 }
 
@@ -1598,7 +1769,29 @@ func (az *Azure) CompleteMultipartUpload(ctx context.Context, input *s3.Complete
 
 	props, err := blobClient.GetProperties(ctx, nil)
 	if err != nil {
-		return res, "", parseMpError(err)
+		mpErr := parseMpError(err)
+		// If the tmp blob is already gone, the upload may have already been
+		// completed. Check the final object's mp-metadata and return success
+		// if the upload IDs match.
+		if errors.Is(mpErr, s3err.GetAPIError(s3err.ErrNoSuchUpload)) {
+			finalClient, clientErr := az.getBlobClient(*input.Bucket, *input.Key)
+			if clientErr == nil {
+				finalProps, propErr := finalClient.GetProperties(ctx, nil)
+				if propErr == nil {
+					if mpMetaStr, ok := finalProps.Metadata[string(keyMpMetadata)]; ok && mpMetaStr != nil {
+						var mpMeta backend.MpUploadMetadata
+						if jsonErr := json.Unmarshal([]byte(*mpMetaStr), &mpMeta); jsonErr == nil && mpMeta.UploadID == *input.UploadId {
+							return s3response.CompleteMultipartUploadResult{
+								Bucket: input.Bucket,
+								Key:    input.Key,
+								ETag:   backend.GetPtrFromString(convertAzureEtag(finalProps.ETag)),
+							}, "", nil
+						}
+					}
+				}
+			}
+		}
+		return res, "", mpErr
 	}
 	tags, err := blobClient.GetTags(ctx, nil)
 	if err != nil {
@@ -1646,6 +1839,8 @@ func (az *Azure) CompleteMultipartUpload(ctx context.Context, input *s3.Complete
 	// The initial value is the lower limit of partNumber: 0
 	var totalSize int64
 	var partNumber int32
+	// partSizes[i] = cumulative byte offset after part i+1 (see backend.MpUploadMetadata)
+	var partSizes []int64
 	last := len(input.MultipartUpload.Parts) - 1
 	for i, part := range input.MultipartUpload.Parts {
 		if part.PartNumber == nil {
@@ -1672,6 +1867,7 @@ func (az *Azure) CompleteMultipartUpload(ctx context.Context, input *s3.Complete
 					return res, "", s3err.GetAPIError(s3err.ErrEntityTooSmall)
 				}
 				// Zero-byte parts contribute no data; skip adding to blockIds.
+				partSizes = append(partSizes, totalSize)
 				continue
 			}
 			return res, "", s3err.GetAPIError(s3err.ErrInvalidPart)
@@ -1686,6 +1882,7 @@ func (az *Azure) CompleteMultipartUpload(ctx context.Context, input *s3.Complete
 			return res, "", s3err.GetAPIError(s3err.ErrEntityTooSmall)
 		}
 		totalSize += *block.Size
+		partSizes = append(partSizes, totalSize)
 		blockIds = append(blockIds, *block.Name)
 	}
 
@@ -1696,6 +1893,18 @@ func (az *Azure) CompleteMultipartUpload(ctx context.Context, input *s3.Complete
 
 	// Remove internal tracking keys from metadata before storing on the final blob.
 	delete(props.Metadata, string(keyMpZeroBytesParts))
+
+	// Serialize multipart metadata so GetObject/HeadObject can serve by part-number.
+	mpMeta := backend.MpUploadMetadata{UploadID: *input.UploadId, Parts: partSizes}
+	mpMetaJSON, err := json.Marshal(mpMeta)
+	if err != nil {
+		return res, "", fmt.Errorf("marshal mp metadata: %w", err)
+	}
+	mpMetaStr := string(mpMetaJSON)
+	if props.Metadata == nil {
+		props.Metadata = map[string]*string{}
+	}
+	props.Metadata[string(keyMpMetadata)] = &mpMetaStr
 
 	opts := &blockblob.CommitBlockListOptions{
 		Metadata: props.Metadata,

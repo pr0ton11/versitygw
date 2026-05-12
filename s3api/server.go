@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -56,6 +57,20 @@ type S3ApiServer struct {
 	webuiSrvCfg      *webui.ServerConfig
 	proxyHeader      string
 	trustedProxies   []string
+	routes           []routeMount
+	middlewares      []middlewareMount
+	socketPerm       os.FileMode
+}
+
+type routeMount struct {
+	method   string
+	path     string
+	handlers []fiber.Handler
+}
+
+type middlewareMount struct {
+	prefix  string
+	handler fiber.Handler
 }
 
 func New(
@@ -136,6 +151,21 @@ func New(
 	// initialize total requests cap limiter middleware
 	app.Use(middlewares.RateLimiter(server.maxRequests, mm, l))
 
+	for _, route := range server.routes {
+		method, err := validateRouteMount(route)
+		if err != nil {
+			return nil, err
+		}
+		app.Add(method, route.path, route.handlers...)
+	}
+
+	for _, mount := range server.middlewares {
+		if err := validateMiddlewareMount(mount); err != nil {
+			return nil, err
+		}
+		app.Use(mount.prefix, mount.handler)
+	}
+
 	// initilaze the default value setter middleware
 	app.Use(middlewares.SetDefaultValues(root, region))
 
@@ -151,6 +181,48 @@ func New(
 	server.Router.Init()
 
 	return server, nil
+}
+
+func validateRouteMount(route routeMount) (string, error) {
+	if route.method == "" {
+		return "", fmt.Errorf("invalid route for path %q: empty method", route.path)
+	}
+	method := strings.ToUpper(route.method)
+	if !isStandardHTTPMethod(method) {
+		return "", fmt.Errorf("invalid HTTP method %q for route path %q: must be one of %s",
+			route.method, route.path, strings.Join(fiber.DefaultMethods, ", "))
+	}
+	if route.path == "" || route.path[0] != '/' {
+		return "", fmt.Errorf("invalid route path %q: must start with /", route.path)
+	}
+	if len(route.handlers) == 0 {
+		return "", fmt.Errorf("invalid route for %s %s: no handlers", method, route.path)
+	}
+	for i, handler := range route.handlers {
+		if handler == nil {
+			return "", fmt.Errorf("invalid route for %s %s: nil handler at index %d", method, route.path, i)
+		}
+	}
+	return method, nil
+}
+
+func isStandardHTTPMethod(method string) bool {
+	for _, valid := range fiber.DefaultMethods {
+		if method == valid {
+			return true
+		}
+	}
+	return false
+}
+
+func validateMiddlewareMount(mount middlewareMount) error {
+	if mount.prefix == "" || mount.prefix[0] != '/' {
+		return fmt.Errorf("invalid middleware prefix %q: must start with /", mount.prefix)
+	}
+	if mount.handler == nil {
+		return fmt.Errorf("invalid middleware for prefix %q: nil handler", mount.prefix)
+	}
+	return nil
 }
 
 // Option sets various options for New()
@@ -225,6 +297,32 @@ func WithWebUI(prefix string, cfg *webui.ServerConfig) Option {
 	}
 }
 
+// WithRoute registers a top-level Fiber route after the gateway rate limiter
+// and before S3 routes are registered. Handlers are terminal unless they
+// explicitly call ctx.Next().
+func WithRoute(method, path string, handlers ...fiber.Handler) Option {
+	return func(s *S3ApiServer) {
+		copied := append([]fiber.Handler(nil), handlers...)
+		s.routes = append(s.routes, routeMount{
+			method:   method,
+			path:     path,
+			handlers: copied,
+		})
+	}
+}
+
+// WithMiddleware mounts a Fiber middleware after the gateway rate limiter and
+// before the S3 route table is registered. The middleware must call ctx.Next()
+// for requests it does not fully handle.
+func WithMiddleware(prefix string, handler fiber.Handler) Option {
+	return func(s *S3ApiServer) {
+		s.middlewares = append(s.middlewares, middlewareMount{
+			prefix:  prefix,
+			handler: handler,
+		})
+	}
+}
+
 // WithConcurrencyLimiter sets the server's maximum connection limit
 // and the hard limit for in-flight requests.
 func WithConcurrencyLimiter(maxConnections, maxRequests int) Option {
@@ -232,6 +330,13 @@ func WithConcurrencyLimiter(maxConnections, maxRequests int) Option {
 		s.maxConnections = maxConnections
 		s.maxRequests = maxRequests
 	}
+}
+
+// WithSocketPerm sets the file-mode permissions applied to file-backed UNIX
+// domain sockets after binding. It has no effect on TCP/IP or abstract
+// namespace sockets.
+func WithSocketPerm(perm os.FileMode) Option {
+	return func(s *S3ApiServer) { s.socketPerm = perm }
 }
 
 // WithDisableACL disables the s3 api server ACLs, by ignoring all
@@ -256,9 +361,9 @@ func (sa *S3ApiServer) ServeMultiPort(ports []string) error {
 		var err error
 
 		if sa.CertStorage != nil {
-			ln, err = utils.NewMultiAddrTLSListener(sa.app.Config().Network, portSpec, sa.CertStorage.GetCertificate)
+			ln, err = utils.NewMultiAddrTLSListener(sa.app.Config().Network, portSpec, sa.CertStorage.GetCertificate, utils.ListenerOptions{SocketPerm: sa.socketPerm})
 		} else {
-			ln, err = utils.NewMultiAddrListener(sa.app.Config().Network, portSpec)
+			ln, err = utils.NewMultiAddrListener(sa.app.Config().Network, portSpec, utils.ListenerOptions{SocketPerm: sa.socketPerm})
 		}
 		if err != nil {
 			return fmt.Errorf("failed to bind s3 listener %s: %w", portSpec, err)

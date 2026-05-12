@@ -40,6 +40,7 @@ func TestAuthentication(ts *TestState) {
 	ts.Run(Authentication_invalid_sha256_payload_hash)
 	ts.Run(Authentication_md5)
 	ts.Run(Authentication_signature_error_incorrect_secret_key)
+	ts.Run(Authentication_sigv2_not_supported)
 	ts.Run(Authentication_with_expect_header)
 }
 
@@ -64,6 +65,7 @@ func TestPresignedAuthentication(ts *TestState) {
 	ts.Run(PresignedAuth_exceeding_expiration_query_param)
 	ts.Run(PresignedAuth_expired_request)
 	ts.Run(PresignedAuth_incorrect_secret_key)
+	ts.Run(PresignedAuth_sigv2_not_supported)
 	ts.Run(PresignedAuth_PutObject_success)
 	ts.Run(PresignedAuth_Put_GetObject_with_data)
 	if !ts.conf.azureTests {
@@ -203,11 +205,11 @@ func TestPutObject(ts *TestState) {
 func TestHeadObject(ts *TestState) {
 	ts.Run(HeadObject_non_existing_object)
 	ts.Run(HeadObject_invalid_part_number)
-	ts.Run(HeadObject_part_number_not_supported)
 	ts.Run(HeadObject_directory_object_noslash)
 	ts.Run(HeadObject_non_existing_dir_object)
 	ts.Run(HeadObject_invalid_parent_dir)
 	ts.Run(HeadObject_with_range)
+	ts.Run(HeadObject_by_range_resp_status)
 	ts.Run(HeadObject_zero_len_with_range)
 	ts.Run(HeadObject_dir_with_range)
 	ts.Run(HeadObject_conditional_reads)
@@ -215,11 +217,18 @@ func TestHeadObject(ts *TestState) {
 	if !ts.conf.azureTests {
 		ts.Run(HeadObject_not_enabled_checksum_mode)
 		ts.Run(HeadObject_checksums)
+		ts.Run(HeadObject_ranged_with_checksum_mode)
 	}
 	ts.Run(HeadObject_success)
 	ts.Run(HeadObject_overrides_success)
 	ts.Run(HeadObject_overrides_presign_success)
 	ts.Run(HeadObject_overrides_fail_public)
+	ts.Run(HeadObject_range_and_part_number)
+	ts.Run(HeadObject_mp_part_number_exceeds_parts_count)
+	ts.Run(HeadObject_mp_part_number_success)
+	ts.Run(HeadObject_mp_part_number_resp_status)
+	ts.Run(HeadObject_non_mp_part_number_1_success)
+	ts.Run(HeadObject_empty_object_part_number_1)
 }
 
 func TestGetObjectAttributes(ts *TestState) {
@@ -247,8 +256,10 @@ func TestGetObject(ts *TestState) {
 	ts.Run(GetObject_conditional_reads)
 	//TODO: remove the condition after implementing checksums in azure
 	if !ts.conf.azureTests {
+		ts.Run(GetObject_not_enabled_checksum_mode)
 		ts.Run(GetObject_checksums)
 		ts.Run(GetObject_dir_object_checksum)
+		ts.Run(GetObject_ranged_with_checksum_mode)
 	}
 	ts.Run(GetObject_success)
 	ts.Run(GetObject_directory_success)
@@ -258,7 +269,12 @@ func TestGetObject(ts *TestState) {
 	ts.Run(GetObject_overrides_presign_success)
 	ts.Run(GetObject_overrides_fail_public)
 	ts.Run(GetObject_invalid_part_number)
-	ts.Run(GetObject_part_number_not_supported)
+	ts.Run(GetObject_range_and_part_number)
+	ts.Run(GetObject_mp_part_number_exceeds_parts_count)
+	ts.Run(GetObject_mp_part_number_success)
+	ts.Run(GetObject_mp_part_number_resp_status)
+	ts.Run(GetObject_non_mp_part_number_1_success)
+	ts.Run(GetObject_empty_object_part_number_1)
 }
 
 func TestListObjects(ts *TestState) {
@@ -276,6 +292,10 @@ func TestListObjects(ts *TestState) {
 	ts.Run(ListObjects_nested_dir_file_objs)
 	ts.Run(ListObjects_check_owner)
 	ts.Run(ListObjects_non_truncated_common_prefixes)
+	ts.Run(ListObjects_should_not_list_pending_mps)
+	ts.Run(ListObjects_mp_masking_with_marker)
+	ts.Run(ListObjects_mp_masking_truncation)
+	ts.Run(ListObjects_mp_masking_delimiter)
 	//TODO: remove the condition after implementing checksums in azure
 	if !ts.conf.azureTests {
 		ts.Run(ListObjects_with_checksum)
@@ -284,10 +304,7 @@ func TestListObjects(ts *TestState) {
 
 func TestListObjectsV2(ts *TestState) {
 	ts.Run(ListObjectsV2_start_after)
-	// posix continuation token not compatible with azure
-	if !ts.conf.azureTests {
-		ts.Run(ListObjectsV2_both_start_after_and_continuation_token)
-	}
+	ts.Run(ListObjectsV2_both_start_after_and_continuation_token)
 	ts.Run(ListObjectsV2_start_after_not_in_list)
 	ts.Run(ListObjectsV2_start_after_empty_result)
 	ts.Run(ListObjectsV2_both_delimiter_and_prefix)
@@ -303,6 +320,10 @@ func TestListObjectsV2(ts *TestState) {
 		ts.Run(ListObjectsV2_with_checksum)
 	}
 	ts.Run(ListObjectsV2_invalid_parent_prefix)
+	ts.Run(ListObjectsV2_should_not_list_pending_mps)
+	ts.Run(ListObjectsV2_mp_masking_start_after)
+	ts.Run(ListObjectsV2_mp_masking_truncation)
+	ts.Run(ListObjectsV2_mp_masking_delimiter)
 }
 
 // VD stands for Versioning Disabled
@@ -428,7 +449,6 @@ func TestUploadPart(ts *TestState) {
 		ts.Run(UploadPart_incorrect_checksums)
 		ts.Run(UploadPart_no_checksum_with_full_object_checksum_type)
 		ts.Run(UploadPart_no_checksum_with_composite_checksum_type)
-		ts.Run(UploadPart_should_calculate_checksum_if_only_algorithm_is_provided)
 		ts.Run(UploadPart_with_checksums_success)
 	}
 	ts.Run(UploadPart_success)
@@ -534,7 +554,8 @@ func TestCompleteMultipartUpload(ts *TestState) {
 		ts.Run(CompleteMultipartUpload_with_metadata)
 	}
 	ts.Run(CompleteMultipartUpload_success)
-	if !ts.conf.azureTests {
+	ts.Run(CompleteMultipartUpload_already_completed)
+	if !(ts.conf.azureTests || ts.conf.sidecarTests) {
 		ts.Run(CompleteMultipartUpload_racey_success)
 		ts.Run(CompleteMultipartUpload_racey_data_integrity)
 	}
@@ -1039,6 +1060,15 @@ func TestAccessControl(ts *TestState) {
 	ts.Run(AccessControl_root_PutBucketAcl)
 	ts.Run(AccessControl_user_PutBucketAcl_with_policy_access)
 	ts.Run(AccessControl_copy_object_with_starting_slash_for_user)
+	ts.Run(AccessControl_PutObject_with_tagging_policy)
+	ts.Run(AccessControl_PutObject_with_legal_hold_policy)
+	ts.Run(AccessControl_PutObject_with_retention_policy)
+	ts.Run(AccessControl_CreateMultipartUpload_with_tagging_policy)
+	ts.Run(AccessControl_CreateMultipartUpload_with_legal_hold_policy)
+	ts.Run(AccessControl_CreateMultipartUpload_with_retention_policy)
+	ts.Run(AccessControl_CopyObject_with_tagging_policy)
+	ts.Run(AccessControl_CopyObject_with_legal_hold_policy)
+	ts.Run(AccessControl_CopyObject_with_retention_policy)
 }
 
 func TestPublicBuckets(ts *TestState) {
@@ -1303,6 +1333,7 @@ func GetIntTests() IntTests {
 		"Authentication_invalid_sha256_payload_hash":                               Authentication_invalid_sha256_payload_hash,
 		"Authentication_md5":                                                       Authentication_md5,
 		"Authentication_signature_error_incorrect_secret_key":                      Authentication_signature_error_incorrect_secret_key,
+		"Authentication_sigv2_not_supported":                                       Authentication_sigv2_not_supported,
 		"Authentication_with_expect_header":                                        Authentication_with_expect_header,
 		"PresignedAuth_security_token_not_supported":                               PresignedAuth_security_token_not_supported,
 		"PresignedAuth_unsupported_algorithm":                                      PresignedAuth_unsupported_algorithm,
@@ -1324,6 +1355,7 @@ func GetIntTests() IntTests {
 		"PresignedAuth_exceeding_expiration_query_param":                           PresignedAuth_exceeding_expiration_query_param,
 		"PresignedAuth_expired_request":                                            PresignedAuth_expired_request,
 		"PresignedAuth_incorrect_secret_key":                                       PresignedAuth_incorrect_secret_key,
+		"PresignedAuth_sigv2_not_supported":                                        PresignedAuth_sigv2_not_supported,
 		"PresignedAuth_PutObject_success":                                          PresignedAuth_PutObject_success,
 		"PutObject_missing_object_lock_retention_config":                           PutObject_missing_object_lock_retention_config,
 		"PutObject_name_too_long":                                                  PutObject_name_too_long,
@@ -1416,21 +1448,28 @@ func GetIntTests() IntTests {
 		"PutObject_racey_success":                                                  PutObject_racey_success,
 		"HeadObject_non_existing_object":                                           HeadObject_non_existing_object,
 		"HeadObject_invalid_part_number":                                           HeadObject_invalid_part_number,
-		"HeadObject_part_number_not_supported":                                     HeadObject_part_number_not_supported,
 		"HeadObject_directory_object_noslash":                                      HeadObject_directory_object_noslash,
 		"HeadObject_non_existing_dir_object":                                       HeadObject_non_existing_dir_object,
 		"HeadObject_name_too_long":                                                 HeadObject_name_too_long,
 		"HeadObject_invalid_parent_dir":                                            HeadObject_invalid_parent_dir,
 		"HeadObject_with_range":                                                    HeadObject_with_range,
+		"HeadObject_by_range_resp_status":                                          HeadObject_by_range_resp_status,
 		"HeadObject_zero_len_with_range":                                           HeadObject_zero_len_with_range,
 		"HeadObject_dir_with_range":                                                HeadObject_dir_with_range,
 		"HeadObject_conditional_reads":                                             HeadObject_conditional_reads,
 		"HeadObject_not_enabled_checksum_mode":                                     HeadObject_not_enabled_checksum_mode,
 		"HeadObject_checksums":                                                     HeadObject_checksums,
+		"HeadObject_ranged_with_checksum_mode":                                     HeadObject_ranged_with_checksum_mode,
 		"HeadObject_success":                                                       HeadObject_success,
 		"HeadObject_overrides_success":                                             HeadObject_overrides_success,
 		"HeadObject_overrides_presign_success":                                     HeadObject_overrides_presign_success,
 		"HeadObject_overrides_fail_public":                                         HeadObject_overrides_fail_public,
+		"HeadObject_range_and_part_number":                                         HeadObject_range_and_part_number,
+		"HeadObject_mp_part_number_exceeds_parts_count":                            HeadObject_mp_part_number_exceeds_parts_count,
+		"HeadObject_mp_part_number_success":                                        HeadObject_mp_part_number_success,
+		"HeadObject_mp_part_number_resp_status":                                    HeadObject_mp_part_number_resp_status,
+		"HeadObject_non_mp_part_number_1_success":                                  HeadObject_non_mp_part_number_1_success,
+		"HeadObject_empty_object_part_number_1":                                    HeadObject_empty_object_part_number_1,
 		"GetObjectAttributes_non_existing_bucket":                                  GetObjectAttributes_non_existing_bucket,
 		"GetObjectAttributes_non_existing_object":                                  GetObjectAttributes_non_existing_object,
 		"GetObjectAttributes_invalid_attrs":                                        GetObjectAttributes_invalid_attrs,
@@ -1447,8 +1486,10 @@ func GetIntTests() IntTests {
 		"GetObject_invalid_parent":                                                 GetObject_invalid_parent,
 		"GetObject_large_object":                                                   GetObject_large_object,
 		"GetObject_conditional_reads":                                              GetObject_conditional_reads,
+		"GetObject_not_enabled_checksum_mode":                                      GetObject_not_enabled_checksum_mode,
 		"GetObject_checksums":                                                      GetObject_checksums,
 		"GetObject_dir_object_checksum":                                            GetObject_dir_object_checksum,
+		"GetObject_ranged_with_checksum_mode":                                      GetObject_ranged_with_checksum_mode,
 		"GetObject_success":                                                        GetObject_success,
 		"GetObject_directory_success":                                              GetObject_directory_success,
 		"GetObject_by_range_resp_status":                                           GetObject_by_range_resp_status,
@@ -1457,7 +1498,12 @@ func GetIntTests() IntTests {
 		"GetObject_overrides_presign_success":                                      GetObject_overrides_presign_success,
 		"GetObject_overrides_fail_public":                                          GetObject_overrides_fail_public,
 		"GetObject_invalid_part_number":                                            GetObject_invalid_part_number,
-		"GetObject_part_number_not_supported":                                      GetObject_part_number_not_supported,
+		"GetObject_range_and_part_number":                                          GetObject_range_and_part_number,
+		"GetObject_mp_part_number_exceeds_parts_count":                             GetObject_mp_part_number_exceeds_parts_count,
+		"GetObject_mp_part_number_success":                                         GetObject_mp_part_number_success,
+		"GetObject_mp_part_number_resp_status":                                     GetObject_mp_part_number_resp_status,
+		"GetObject_non_mp_part_number_1_success":                                   GetObject_non_mp_part_number_1_success,
+		"GetObject_empty_object_part_number_1":                                     GetObject_empty_object_part_number_1,
 		"ListObjects_non_existing_bucket":                                          ListObjects_non_existing_bucket,
 		"ListObjects_with_prefix":                                                  ListObjects_with_prefix,
 		"ListObjects_truncated":                                                    ListObjects_truncated,
@@ -1471,7 +1517,16 @@ func GetIntTests() IntTests {
 		"ListObjects_nested_dir_file_objs":                                         ListObjects_nested_dir_file_objs,
 		"ListObjects_check_owner":                                                  ListObjects_check_owner,
 		"ListObjects_non_truncated_common_prefixes":                                ListObjects_non_truncated_common_prefixes,
+		"ListObjects_should_not_list_pending_mps":                                  ListObjects_should_not_list_pending_mps,
+		"ListObjects_mp_masking_with_marker":                                       ListObjects_mp_masking_with_marker,
+		"ListObjects_mp_masking_truncation":                                        ListObjects_mp_masking_truncation,
+		"ListObjects_mp_masking_delimiter":                                         ListObjects_mp_masking_delimiter,
 		"ListObjectsV2_non_truncated_common_prefixes":                              ListObjectsV2_non_truncated_common_prefixes,
+		"ListObjectsV2_invalid_parent_prefix":                                      ListObjectsV2_invalid_parent_prefix,
+		"ListObjectsV2_should_not_list_pending_mps":                                ListObjectsV2_should_not_list_pending_mps,
+		"ListObjectsV2_mp_masking_start_after":                                     ListObjectsV2_mp_masking_start_after,
+		"ListObjectsV2_mp_masking_truncation":                                      ListObjectsV2_mp_masking_truncation,
+		"ListObjectsV2_mp_masking_delimiter":                                       ListObjectsV2_mp_masking_delimiter,
 		"ListObjects_with_checksum":                                                ListObjects_with_checksum,
 		"ListObjectsV2_start_after":                                                ListObjectsV2_start_after,
 		"ListObjectsV2_both_start_after_and_continuation_token":                    ListObjectsV2_both_start_after_and_continuation_token,
@@ -1575,7 +1630,6 @@ func GetIntTests() IntTests {
 		"UploadPart_incorrect_checksums":                                           UploadPart_incorrect_checksums,
 		"UploadPart_no_checksum_with_full_object_checksum_type":                    UploadPart_no_checksum_with_full_object_checksum_type,
 		"UploadPart_no_checksum_with_composite_checksum_type":                      UploadPart_no_checksum_with_composite_checksum_type,
-		"UploadPart_should_calculate_checksum_if_only_algorithm_is_provided":       UploadPart_should_calculate_checksum_if_only_algorithm_is_provided,
 		"UploadPart_with_checksums_success":                                        UploadPart_with_checksums_success,
 		"UploadPart_success":                                                       UploadPart_success,
 		"UploadPartCopy_non_existing_bucket":                                       UploadPartCopy_non_existing_bucket,
@@ -1650,6 +1704,7 @@ func GetIntTests() IntTests {
 		"CompleteMultipartUpload_should_ignore_the_final_checksum":                 CompleteMultipartUpload_should_ignore_the_final_checksum,
 		"CompleteMultipartUpload_should_succeed_without_final_checksum_type":       CompleteMultipartUpload_should_succeed_without_final_checksum_type,
 		"CompleteMultipartUpload_success":                                          CompleteMultipartUpload_success,
+		"CompleteMultipartUpload_already_completed":                                CompleteMultipartUpload_already_completed,
 		"CompleteMultipartUpload_racey_success":                                    CompleteMultipartUpload_racey_success,
 		"CompleteMultipartUpload_racey_data_integrity":                             CompleteMultipartUpload_racey_data_integrity,
 		"PutBucketAcl_non_existing_bucket":                                         PutBucketAcl_non_existing_bucket,
@@ -1872,6 +1927,15 @@ func GetIntTests() IntTests {
 		"AccessControl_root_PutBucketAcl":                                          AccessControl_root_PutBucketAcl,
 		"AccessControl_user_PutBucketAcl_with_policy_access":                       AccessControl_user_PutBucketAcl_with_policy_access,
 		"AccessControl_copy_object_with_starting_slash_for_user":                   AccessControl_copy_object_with_starting_slash_for_user,
+		"AccessControl_PutObject_with_tagging_policy":                              AccessControl_PutObject_with_tagging_policy,
+		"AccessControl_PutObject_with_legal_hold_policy":                           AccessControl_PutObject_with_legal_hold_policy,
+		"AccessControl_PutObject_with_retention_policy":                            AccessControl_PutObject_with_retention_policy,
+		"AccessControl_CreateMultipartUpload_with_tagging_policy":                  AccessControl_CreateMultipartUpload_with_tagging_policy,
+		"AccessControl_CreateMultipartUpload_with_legal_hold_policy":               AccessControl_CreateMultipartUpload_with_legal_hold_policy,
+		"AccessControl_CreateMultipartUpload_with_retention_policy":                AccessControl_CreateMultipartUpload_with_retention_policy,
+		"AccessControl_CopyObject_with_tagging_policy":                             AccessControl_CopyObject_with_tagging_policy,
+		"AccessControl_CopyObject_with_legal_hold_policy":                          AccessControl_CopyObject_with_legal_hold_policy,
+		"AccessControl_CopyObject_with_retention_policy":                           AccessControl_CopyObject_with_retention_policy,
 		"PublicBucket_default_private_bucket":                                      PublicBucket_default_private_bucket,
 		"PublicBucket_public_bucket_policy":                                        PublicBucket_public_bucket_policy,
 		"PublicBucket_public_object_policy":                                        PublicBucket_public_object_policy,

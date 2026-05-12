@@ -109,7 +109,7 @@ const hasSubtleCrypto = typeof crypto !== 'undefined' && typeof crypto.subtle !=
  */
 function encodeS3Key(key) {
   if (!key) return '';
-  return key.split('/').map(segment => encodeURIComponent(segment)).join('/');
+  return key.split('/').map(segment => awsUriEncode(segment)).join('/');
 }
 
 class VersityAPI {
@@ -161,7 +161,7 @@ class VersityAPI {
     // Sort query params for canonical request
     const sortedParams = [...url.searchParams.entries()].sort((a, b) => a[0].localeCompare(b[0]));
     const canonicalQueryString = sortedParams
-      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .map(([k, v]) => `${awsUriEncode(k)}=${awsUriEncode(v)}`)
       .join('&');
 
     const canonicalHeaders = `host:${host}\n`;
@@ -526,7 +526,7 @@ class VersityAPI {
     // Sort query parameters
     const sortedParams = [...url.searchParams.entries()].sort((a, b) => a[0].localeCompare(b[0]));
     const canonicalQueryString = sortedParams.map(([k, v]) =>
-      `${encodeURIComponent(k)}=${encodeURIComponent(v)}`
+      `${awsUriEncode(k)}=${awsUriEncode(v)}`
     ).join('&');
 
     // Hash the payload
@@ -627,7 +627,7 @@ class VersityAPI {
     // Sort query parameters
     const sortedParams = [...url.searchParams.entries()].sort((a, b) => a[0].localeCompare(b[0]));
     const canonicalQueryString = sortedParams.map(([k, v]) =>
-      `${encodeURIComponent(k)}=${encodeURIComponent(v)}`
+      `${awsUriEncode(k)}=${awsUriEncode(v)}`
     ).join('&');
 
     // Hash the payload
@@ -697,7 +697,7 @@ class VersityAPI {
    * @param {string} contentType - Content type for the request
    * @param {Object} additionalHeaders - Additional headers to include
    */
-  async request(method, path, queryParams = {}, body = '', useAdminEndpoint = false, contentType = 'application/xml', additionalHeaders = {}) {
+  async request(method, path, queryParams = {}, body = '', useAdminEndpoint = false, contentType = 'application/xml', additionalHeaders = {}, signal = null) {
     if (!this.credentials) {
       throw new Error('Not authenticated');
     }
@@ -714,6 +714,7 @@ class VersityAPI {
         method,
         headers,
         body: body || undefined,
+        signal: signal || undefined,
       });
     } catch (e) {
       // Browsers surface CORS blocks as a generic TypeError.
@@ -1047,7 +1048,7 @@ class VersityAPI {
   /**
    * List objects in a bucket (S3 ListObjectsV2)
    */
-  async listObjectsV2(bucket, prefix = '', delimiter = '/', maxKeys = 1000, continuationToken = null) {
+  async listObjectsV2(bucket, prefix = '', delimiter = '/', maxKeys = 1000, continuationToken = null, signal = null) {
     const params = {
       'list-type': '2',
       'prefix': prefix,
@@ -1059,7 +1060,7 @@ class VersityAPI {
       params['continuation-token'] = continuationToken;
     }
 
-    const response = await this.request('GET', `/${bucket}`, params);
+    const response = await this.request('GET', `/${bucket}`, params, '', false, 'application/xml', {}, signal);
     return this.parseListObjectsV2Response(response);
   }
 
@@ -1234,7 +1235,7 @@ class VersityAPI {
     // Sort query parameters
     const sortedParams = [...url.searchParams.entries()].sort((a, b) => a[0].localeCompare(b[0]));
     const canonicalQueryString = sortedParams.map(([k, v]) =>
-      `${encodeURIComponent(k)}=${encodeURIComponent(v)}`
+      `${awsUriEncode(k)}=${awsUriEncode(v)}`
     ).join('&');
 
     // Create canonical headers
@@ -1615,7 +1616,7 @@ class VersityAPI {
   /**
    * List all versions of objects in a bucket
    */
-  async listObjectVersions(bucket, prefix = '', delimiter = '/', maxKeys = 1000, keyMarker = null, versionIdMarker = null) {
+  async listObjectVersions(bucket, prefix = '', delimiter = '/', maxKeys = 1000, keyMarker = null, versionIdMarker = null, signal = null) {
     const params = {
       versions: '',
       prefix: prefix,
@@ -1626,7 +1627,7 @@ class VersityAPI {
     if (keyMarker) params['key-marker'] = keyMarker;
     if (versionIdMarker) params['version-id-marker'] = versionIdMarker;
 
-    const response = await this.request('GET', `/${bucket}`, params);
+    const response = await this.request('GET', `/${bucket}`, params, '', false, 'application/xml', {}, signal);
     return this.parseListObjectVersionsResponse(response);
   }
 
@@ -2057,6 +2058,22 @@ ${tagsXml}
     }
     return result;
   }
+}
+
+/**
+ * URI-encode a string per the AWS SigV4 specification.
+ * All characters except the unreserved set (A-Za-z0-9 - _ . ~) are percent-encoded,
+ * with hexadecimal digits in uppercase (e.g. %2F, not %2f).
+ *
+ * @param {string} text - The string to encode.
+ * @returns {string} The percent-encoded string.
+ */
+ function awsUriEncode(text) {
+  return encodeURIComponent(text)
+    .replace(
+      /['()*!]/g,
+      (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+    );
 }
 
 // Create global API instance

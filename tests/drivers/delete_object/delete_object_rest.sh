@@ -17,11 +17,11 @@
 source ./tests/commands/list_objects_v2.sh
 source ./tests/drivers/list_object_versions/list_object_versions_rest.sh
 source ./tests/drivers/xml.sh
-source ./tests/util/util_legal_hold.sh
+source ./tests/drivers/get_object_legal_hold/get_object_legal_hold_rest.sh
 
 list_and_delete_objects() {
-  log 6 "list_and_delete_objects"
-  if ! check_param_count "list_and_delete_objects" "bucket" 1 $#; then
+  log 6 "list_and_delete_objects: '$1'"
+  if ! check_param_count_v2 "bucket" 1 $#; then
     return 1
   fi
   local response
@@ -30,6 +30,7 @@ list_and_delete_objects() {
     return 1
   fi
   mapfile -t object_array <<< "$response"
+  log 5 "objects: ${object_array[*]}"
   for object in "${object_array[@]}"; do
     if [ "$object" == "" ]; then
       break
@@ -63,6 +64,7 @@ delete_old_versions_base64() {
     return 1
   fi
 
+  # shellcheck disable=SC2154
   log 5 "base64 versions: ${base64_pairs[*]}"
   for pair in "${base64_pairs[@]}"; do
     log 5 "pair: $pair"
@@ -171,6 +173,7 @@ delete_delete_marker() {
     echo "error parsing delete marker ID"
     return 1
   fi
+  # shellcheck disable=SC2154
   log 5 "version or marker ID: $version_or_marker_id"
   if ! delete_object_version_rest "$bucket_name" "$object_key" "$version_or_marker_id"; then
     log 2 "error deleting delete marker"

@@ -55,7 +55,7 @@ func (c S3ApiController) PutObjectTagging(ctx *fiber.Ctx) (*Response, error) {
 		Acc:             acct,
 		Bucket:          bucket,
 		Object:          key,
-		Action:          action,
+		Actions:         []auth.Action{action},
 		IsPublicRequest: IsBucketPublic,
 		DisableACL:      c.disableACL,
 	})
@@ -106,7 +106,7 @@ func (c S3ApiController) PutObjectRetention(ctx *fiber.Ctx) (*Response, error) {
 		Acc:             acct,
 		Bucket:          bucket,
 		Object:          key,
-		Action:          auth.PutObjectRetentionAction,
+		Actions:         []auth.Action{auth.PutObjectRetentionAction},
 		IsPublicRequest: IsBucketPublic,
 		DisableACL:      c.disableACL,
 	})
@@ -173,7 +173,7 @@ func (c S3ApiController) PutObjectLegalHold(ctx *fiber.Ctx) (*Response, error) {
 		Acc:             acct,
 		Bucket:          bucket,
 		Object:          key,
-		Action:          auth.PutObjectLegalHoldAction,
+		Actions:         []auth.Action{auth.PutObjectLegalHoldAction},
 		IsPublicRequest: IsBucketPublic,
 		DisableACL:      c.disableACL,
 	})
@@ -243,7 +243,7 @@ func (c S3ApiController) UploadPart(ctx *fiber.Ctx) (*Response, error) {
 			Acc:             acct,
 			Bucket:          bucket,
 			Object:          key,
-			Action:          auth.PutObjectAction,
+			Actions:         []auth.Action{auth.PutObjectAction},
 			IsPublicRequest: IsBucketPublic,
 			DisableACL:      c.disableACL,
 		})
@@ -306,6 +306,11 @@ func (c S3ApiController) UploadPart(ctx *fiber.Ctx) (*Response, error) {
 			ChecksumSHA1:      utils.GetStringPtr(checksums[types.ChecksumAlgorithmSha1]),
 			ChecksumSHA256:    utils.GetStringPtr(checksums[types.ChecksumAlgorithmSha256]),
 			ChecksumCRC64NVME: utils.GetStringPtr(checksums[types.ChecksumAlgorithmCrc64nvme]),
+			ChecksumSHA512:    utils.GetStringPtr(checksums[types.ChecksumAlgorithmSha512]),
+			ChecksumMD5:       utils.GetStringPtr(checksums[types.ChecksumAlgorithmMd5]),
+			ChecksumXXHASH64:  utils.GetStringPtr(checksums[types.ChecksumAlgorithmXxhash64]),
+			ChecksumXXHASH3:   utils.GetStringPtr(checksums[types.ChecksumAlgorithmXxhash3]),
+			ChecksumXXHASH128: utils.GetStringPtr(checksums[types.ChecksumAlgorithmXxhash128]),
 		})
 	var headers map[string]*string
 	if err == nil {
@@ -316,6 +321,11 @@ func (c S3ApiController) UploadPart(ctx *fiber.Ctx) (*Response, error) {
 			"x-amz-checksum-crc64nvme": res.ChecksumCRC64NVME,
 			"x-amz-checksum-sha1":      res.ChecksumSHA1,
 			"x-amz-checksum-sha256":    res.ChecksumSHA256,
+			"x-amz-checksum-sha512":    res.ChecksumSHA512,
+			"x-amz-checksum-md5":       res.ChecksumMD5,
+			"x-amz-checksum-xxhash64":  res.ChecksumXXHASH64,
+			"x-amz-checksum-xxhash3":   res.ChecksumXXHASH3,
+			"x-amz-checksum-xxhash128": res.ChecksumXXHASH128,
 		}
 	}
 	return &Response{
@@ -359,7 +369,7 @@ func (c S3ApiController) UploadPartCopy(ctx *fiber.Ctx) (*Response, error) {
 			Acc:             acct,
 			Bucket:          bucket,
 			Object:          key,
-			Action:          auth.PutObjectAction,
+			Actions:         []auth.Action{auth.PutObjectAction},
 			IsPublicRequest: IsBucketPublic,
 			DisableACL:      c.disableACL,
 		})
@@ -443,7 +453,7 @@ func (c S3ApiController) PutObjectAcl(ctx *fiber.Ctx) (*Response, error) {
 			Acc:           acct,
 			Bucket:        bucket,
 			Object:        key,
-			Action:        auth.PutObjectAclAction,
+			Actions:       []auth.Action{auth.PutObjectAclAction},
 		})
 	if err != nil {
 		return &Response{
@@ -486,6 +496,9 @@ func (c S3ApiController) CopyObject(ctx *fiber.Ctx) (*Response, error) {
 	expires := ctx.Get("Expires")
 	tagging := ctx.Get("x-amz-tagging")
 	storageClass := ctx.Get("X-Amz-Storage-Class")
+	legalHoldHdr := ctx.Get("X-Amz-Object-Lock-Legal-Hold")
+	lockModeHdr := ctx.Get("X-Amz-Object-Lock-Mode")
+	objLockDate := ctx.Get("X-Amz-Object-Lock-Retain-Until-Date")
 	// context locals
 	acct := utils.ContextKeyAccount.Get(ctx).(auth.Account)
 	isRoot := utils.ContextKeyIsRoot.Get(ctx).(bool)
@@ -500,6 +513,17 @@ func (c S3ApiController) CopyObject(ctx *fiber.Ctx) (*Response, error) {
 		}, err
 	}
 
+	actions := []auth.Action{auth.PutObjectAction}
+	if tagging != "" {
+		actions = append(actions, auth.PutObjectTaggingAction)
+	}
+	if legalHoldHdr != "" {
+		actions = append(actions, auth.PutObjectLegalHoldAction)
+	}
+	if lockModeHdr != "" || objLockDate != "" {
+		actions = append(actions, auth.PutObjectRetentionAction)
+	}
+
 	err = auth.VerifyObjectCopyAccess(ctx.Context(), c.be, copySource,
 		auth.AccessOptions{
 			Acl:           parsedAcl,
@@ -508,7 +532,7 @@ func (c S3ApiController) CopyObject(ctx *fiber.Ctx) (*Response, error) {
 			Acc:           acct,
 			Bucket:        bucket,
 			Object:        key,
-			Action:        auth.PutObjectAction,
+			Actions:       actions,
 		})
 	if err != nil {
 		return &Response{
@@ -642,6 +666,9 @@ func (c S3ApiController) PutObject(ctx *fiber.Ctx) (*Response, error) {
 	cacheControl := ctx.Get("Cache-Control")
 	expires := ctx.Get("Expires")
 	tagging := ctx.Get("x-amz-tagging")
+	legalHoldHdr := ctx.Get("X-Amz-Object-Lock-Legal-Hold")
+	lockModeHdr := ctx.Get("X-Amz-Object-Lock-Mode")
+	objLockDate := ctx.Get("X-Amz-Object-Lock-Retain-Until-Date")
 	// context locals
 	acct := utils.ContextKeyAccount.Get(ctx).(auth.Account)
 	isRoot := utils.ContextKeyIsRoot.Get(ctx).(bool)
@@ -660,6 +687,17 @@ func (c S3ApiController) PutObject(ctx *fiber.Ctx) (*Response, error) {
 		contentLengthStr = decodedLength
 	}
 
+	actions := []auth.Action{auth.PutObjectAction}
+	if tagging != "" {
+		actions = append(actions, auth.PutObjectTaggingAction)
+	}
+	if legalHoldHdr != "" {
+		actions = append(actions, auth.PutObjectLegalHoldAction)
+	}
+	if lockModeHdr != "" || objLockDate != "" {
+		actions = append(actions, auth.PutObjectRetentionAction)
+	}
+
 	err := auth.VerifyAccess(ctx.Context(), c.be,
 		auth.AccessOptions{
 			Readonly:        c.readonly,
@@ -669,7 +707,7 @@ func (c S3ApiController) PutObject(ctx *fiber.Ctx) (*Response, error) {
 			Acc:             acct,
 			Bucket:          bucket,
 			Object:          key,
-			Action:          auth.PutObjectAction,
+			Actions:         actions,
 			IsPublicRequest: IsBucketPublic,
 			DisableACL:      c.disableACL,
 		})
@@ -761,6 +799,11 @@ func (c S3ApiController) PutObject(ctx *fiber.Ctx) (*Response, error) {
 			ChecksumSHA1:              utils.GetStringPtr(checksums[types.ChecksumAlgorithmSha1]),
 			ChecksumSHA256:            utils.GetStringPtr(checksums[types.ChecksumAlgorithmSha256]),
 			ChecksumCRC64NVME:         utils.GetStringPtr(checksums[types.ChecksumAlgorithmCrc64nvme]),
+			ChecksumSHA512:            utils.GetStringPtr(checksums[types.ChecksumAlgorithmSha512]),
+			ChecksumMD5:               utils.GetStringPtr(checksums[types.ChecksumAlgorithmMd5]),
+			ChecksumXXHASH64:          utils.GetStringPtr(checksums[types.ChecksumAlgorithmXxhash64]),
+			ChecksumXXHASH3:           utils.GetStringPtr(checksums[types.ChecksumAlgorithmXxhash3]),
+			ChecksumXXHASH128:         utils.GetStringPtr(checksums[types.ChecksumAlgorithmXxhash128]),
 			IfMatch:                   ifMatch,
 			IfNoneMatch:               ifNoneMatch,
 		})
@@ -772,6 +815,11 @@ func (c S3ApiController) PutObject(ctx *fiber.Ctx) (*Response, error) {
 			"x-amz-checksum-crc64nvme": res.ChecksumCRC64NVME,
 			"x-amz-checksum-sha1":      res.ChecksumSHA1,
 			"x-amz-checksum-sha256":    res.ChecksumSHA256,
+			"x-amz-checksum-sha512":    res.ChecksumSHA512,
+			"x-amz-checksum-md5":       res.ChecksumMD5,
+			"x-amz-checksum-xxhash64":  res.ChecksumXXHASH64,
+			"x-amz-checksum-xxhash3":   res.ChecksumXXHASH3,
+			"x-amz-checksum-xxhash128": res.ChecksumXXHASH128,
 			"x-amz-checksum-type":      utils.ConvertToStringPtr(res.ChecksumType),
 			"x-amz-version-id":         &res.VersionID,
 			"x-amz-object-size":        utils.ConvertPtrToStringPtr(res.Size),

@@ -518,6 +518,26 @@ func CompleteMultipartUpload_invalid_final_checksums(s *S3Conf) error {
 				algo: types.ChecksumAlgorithmCrc64nvme,
 				t:    types.ChecksumTypeFullObject,
 			},
+			{
+				algo: types.ChecksumAlgorithmSha512,
+				t:    types.ChecksumTypeComposite,
+			},
+			{
+				algo: types.ChecksumAlgorithmMd5,
+				t:    types.ChecksumTypeComposite,
+			},
+			{
+				algo: types.ChecksumAlgorithmXxhash64,
+				t:    types.ChecksumTypeComposite,
+			},
+			{
+				algo: types.ChecksumAlgorithmXxhash3,
+				t:    types.ChecksumTypeComposite,
+			},
+			{
+				algo: types.ChecksumAlgorithmXxhash128,
+				t:    types.ChecksumTypeComposite,
+			},
 		} {
 
 			mp, err := createMp(s3client, bucket, obj, withChecksum(el.algo),
@@ -534,15 +554,7 @@ func CompleteMultipartUpload_invalid_final_checksums(s *S3Conf) error {
 
 			cParts := []types.CompletedPart{}
 			for _, el := range parts {
-				cParts = append(cParts, types.CompletedPart{
-					ETag:              el.ETag,
-					PartNumber:        el.PartNumber,
-					ChecksumCRC32:     el.ChecksumCRC32C,
-					ChecksumCRC32C:    el.ChecksumCRC32C,
-					ChecksumSHA1:      el.ChecksumSHA1,
-					ChecksumSHA256:    el.ChecksumSHA256,
-					ChecksumCRC64NVME: el.ChecksumCRC64NVME,
-				})
+				cParts = append(cParts, completedPartFromPart(el))
 			}
 
 			mpInput := &s3.CompleteMultipartUploadInput{
@@ -566,6 +578,16 @@ func CompleteMultipartUpload_invalid_final_checksums(s *S3Conf) error {
 				mpInput.ChecksumSHA256 = getPtr("invalid_sha256")
 			case types.ChecksumAlgorithmCrc64nvme:
 				mpInput.ChecksumCRC64NVME = getPtr("invalid_crc64nvme")
+			case types.ChecksumAlgorithmSha512:
+				mpInput.ChecksumSHA512 = getPtr("invalid_sha512")
+			case types.ChecksumAlgorithmMd5:
+				mpInput.ChecksumMD5 = getPtr("invalid_md5")
+			case types.ChecksumAlgorithmXxhash64:
+				mpInput.ChecksumXXHASH64 = getPtr("invalid_xxhash64")
+			case types.ChecksumAlgorithmXxhash3:
+				mpInput.ChecksumXXHASH3 = getPtr("invalid_xxhash3")
+			case types.ChecksumAlgorithmXxhash128:
+				mpInput.ChecksumXXHASH128 = getPtr("invalid_xxhash128")
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
@@ -608,6 +630,26 @@ func CompleteMultipartUpload_incorrect_final_checksums(s *S3Conf) error {
 				algo: types.ChecksumAlgorithmCrc64nvme,
 				t:    types.ChecksumTypeFullObject,
 			},
+			{
+				algo: types.ChecksumAlgorithmSha512,
+				t:    types.ChecksumTypeComposite,
+			},
+			{
+				algo: types.ChecksumAlgorithmMd5,
+				t:    types.ChecksumTypeComposite,
+			},
+			{
+				algo: types.ChecksumAlgorithmXxhash64,
+				t:    types.ChecksumTypeComposite,
+			},
+			{
+				algo: types.ChecksumAlgorithmXxhash3,
+				t:    types.ChecksumTypeComposite,
+			},
+			{
+				algo: types.ChecksumAlgorithmXxhash128,
+				t:    types.ChecksumTypeComposite,
+			},
 		} {
 			mp, err := createMp(s3client, bucket, obj, withChecksum(el.algo),
 				withChecksumType(el.t))
@@ -623,34 +665,23 @@ func CompleteMultipartUpload_incorrect_final_checksums(s *S3Conf) error {
 
 			cParts := []types.CompletedPart{}
 			for _, el := range parts {
-				cParts = append(cParts, types.CompletedPart{
-					ETag:              el.ETag,
-					PartNumber:        el.PartNumber,
-					ChecksumCRC32:     el.ChecksumCRC32,
-					ChecksumCRC32C:    el.ChecksumCRC32C,
-					ChecksumSHA1:      el.ChecksumSHA1,
-					ChecksumSHA256:    el.ChecksumSHA256,
-					ChecksumCRC64NVME: el.ChecksumCRC64NVME,
-				})
+				cParts = append(cParts, completedPartFromPart(el))
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-			_, err = s3client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			input := &s3.CompleteMultipartUploadInput{
 				Bucket:   &bucket,
 				Key:      &obj,
 				UploadId: mp.UploadId,
 				MultipartUpload: &types.CompletedMultipartUpload{
 					Parts: cParts,
 				},
-				// Provide one of the parts checksum. In any case
-				// the final checksum will differ from one of the parts checksum
-				ChecksumCRC32:     cParts[0].ChecksumCRC32,
-				ChecksumCRC32C:    cParts[0].ChecksumCRC32C,
-				ChecksumSHA1:      cParts[0].ChecksumSHA1,
-				ChecksumSHA256:    cParts[0].ChecksumSHA256,
-				ChecksumCRC64NVME: cParts[0].ChecksumCRC64NVME,
-				ChecksumType:      el.t,
-			})
+				ChecksumType: el.t,
+			}
+			// Provide one of the part checksums. The final checksum will differ
+			// from a single part checksum.
+			setCompleteMultipartUploadChecksum(input, el.algo, getCompletedPartChecksum(cParts[0], el.algo))
+			_, err = s3client.CompleteMultipartUpload(ctx, input)
 			cancel()
 			if err := checkApiErr(err, s3err.GetChecksumBadDigestErr(el.algo)); err != nil {
 				return err
@@ -848,6 +879,11 @@ func CompleteMultipartUpload_should_verify_final_composite_checksum(s *S3Conf) e
 			types.ChecksumAlgorithmCrc32c,
 			types.ChecksumAlgorithmSha1,
 			types.ChecksumAlgorithmSha256,
+			types.ChecksumAlgorithmSha512,
+			types.ChecksumAlgorithmMd5,
+			types.ChecksumAlgorithmXxhash64,
+			types.ChecksumAlgorithmXxhash3,
+			types.ChecksumAlgorithmXxhash128,
 		} {
 			mp, err := createMp(s3client, bucket, obj, withChecksumType(types.ChecksumTypeComposite), withChecksum(algo))
 			if err != nil {
@@ -867,29 +903,13 @@ func CompleteMultipartUpload_should_verify_final_composite_checksum(s *S3Conf) e
 			completeParts := make([]types.CompletedPart, 0, len(parts))
 
 			for _, part := range parts {
-				switch algo {
-				case types.ChecksumAlgorithmCrc32:
-					err = processCompositeChecksum(hasher, getString(part.ChecksumCRC32))
-				case types.ChecksumAlgorithmCrc32c:
-					err = processCompositeChecksum(hasher, getString(part.ChecksumCRC32C))
-				case types.ChecksumAlgorithmSha1:
-					err = processCompositeChecksum(hasher, getString(part.ChecksumSHA1))
-				case types.ChecksumAlgorithmSha256:
-					err = processCompositeChecksum(hasher, getString(part.ChecksumSHA256))
-				}
+				err = processCompositeChecksum(hasher, getString(getPartChecksum(part, algo)))
 
 				if err != nil {
 					return fmt.Errorf("test %v failed: %s", i, err)
 				}
 
-				completeParts = append(completeParts, types.CompletedPart{
-					ETag:           part.ETag,
-					PartNumber:     part.PartNumber,
-					ChecksumCRC32:  part.ChecksumCRC32,
-					ChecksumCRC32C: part.ChecksumCRC32C,
-					ChecksumSHA1:   part.ChecksumSHA1,
-					ChecksumSHA256: part.ChecksumSHA256,
-				})
+				completeParts = append(completeParts, completedPartFromPart(part))
 			}
 
 			checksum := fmt.Sprintf("%s-%v", base64.StdEncoding.EncodeToString(hasher.Sum(nil)), len(parts))
@@ -903,16 +923,7 @@ func CompleteMultipartUpload_should_verify_final_composite_checksum(s *S3Conf) e
 				UploadId: mp.UploadId,
 			}
 
-			switch algo {
-			case types.ChecksumAlgorithmCrc32:
-				completeMpInput.ChecksumCRC32 = &checksum
-			case types.ChecksumAlgorithmCrc32c:
-				completeMpInput.ChecksumCRC32C = &checksum
-			case types.ChecksumAlgorithmSha1:
-				completeMpInput.ChecksumSHA1 = &checksum
-			case types.ChecksumAlgorithmSha256:
-				completeMpInput.ChecksumSHA256 = &checksum
-			}
+			setCompleteMultipartUploadChecksum(completeMpInput, algo, &checksum)
 
 			ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
 			res, err := s3client.CompleteMultipartUpload(ctx, completeMpInput)
@@ -921,17 +932,7 @@ func CompleteMultipartUpload_should_verify_final_composite_checksum(s *S3Conf) e
 				return fmt.Errorf("test %v failed: %s", i, err)
 			}
 
-			var gotSum string
-			switch algo {
-			case types.ChecksumAlgorithmCrc32:
-				gotSum = getString(res.ChecksumCRC32)
-			case types.ChecksumAlgorithmCrc32c:
-				gotSum = getString(res.ChecksumCRC32C)
-			case types.ChecksumAlgorithmSha1:
-				gotSum = getString(res.ChecksumSHA1)
-			case types.ChecksumAlgorithmSha256:
-				gotSum = getString(res.ChecksumSHA256)
-			}
+			gotSum := getString(getCompleteMultipartUploadChecksum(res, algo))
 
 			if gotSum != checksum {
 				return fmt.Errorf("test %v failed: expected the final checksum to be %s, instead got %s", i, checksum, gotSum)
@@ -947,20 +948,27 @@ func CompleteMultipartUpload_invalid_final_composite_checksum(s *S3Conf) error {
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		obj := "my-obj"
 		for i, test := range []struct {
-			algo   types.ChecksumAlgorithm
-			crc32  *string
-			crc32c *string
-			sha1   *string
-			sha256 *string
+			algo     types.ChecksumAlgorithm
+			checksum *string
 		}{
-			{types.ChecksumAlgorithmCrc32, getPtr("invalid_checksum"), nil, nil, nil},
-			{types.ChecksumAlgorithmCrc32, getPtr("ImIEBA==-smth"), nil, nil, nil},
-			{types.ChecksumAlgorithmCrc32c, nil, getPtr("invalid_checksum"), nil, nil},
-			{types.ChecksumAlgorithmCrc32c, nil, getPtr("AQIDBA==-12a"), nil, nil},
-			{types.ChecksumAlgorithmSha1, nil, nil, getPtr("invalid_checksum"), nil},
-			{types.ChecksumAlgorithmSha1, nil, nil, getPtr("2jmj7l5rSw0yVb/vlWAYkK/YBwk=-10-20"), nil},
-			{types.ChecksumAlgorithmSha256, nil, nil, nil, getPtr("invalid_checksum")},
-			{types.ChecksumAlgorithmSha256, nil, nil, nil, getPtr("47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=--3")},
+			{types.ChecksumAlgorithmCrc32, getPtr("invalid_checksum")},
+			{types.ChecksumAlgorithmCrc32, getPtr("ImIEBA==-smth")},
+			{types.ChecksumAlgorithmCrc32c, getPtr("invalid_checksum")},
+			{types.ChecksumAlgorithmCrc32c, getPtr("AQIDBA==-12a")},
+			{types.ChecksumAlgorithmSha1, getPtr("invalid_checksum")},
+			{types.ChecksumAlgorithmSha1, getPtr("2jmj7l5rSw0yVb/vlWAYkK/YBwk=-10-20")},
+			{types.ChecksumAlgorithmSha256, getPtr("invalid_checksum")},
+			{types.ChecksumAlgorithmSha256, getPtr("47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=--3")},
+			{types.ChecksumAlgorithmSha512, getPtr("invalid_checksum")},
+			{types.ChecksumAlgorithmSha512, getPtr("z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg==-bad")},
+			{types.ChecksumAlgorithmMd5, getPtr("invalid_checksum")},
+			{types.ChecksumAlgorithmMd5, getPtr("1B2M2Y8AsgTpgAmY7PhCfg==-bad")},
+			{types.ChecksumAlgorithmXxhash64, getPtr("invalid_checksum")},
+			{types.ChecksumAlgorithmXxhash64, getPtr("70bbN1HY6Zk=-bad")},
+			{types.ChecksumAlgorithmXxhash3, getPtr("invalid_checksum")},
+			{types.ChecksumAlgorithmXxhash3, getPtr("LQaABTjTlMI=-bad")},
+			{types.ChecksumAlgorithmXxhash128, getPtr("invalid_checksum")},
+			{types.ChecksumAlgorithmXxhash128, getPtr("maoG0wFHmNhgAcMkRo1Jfw==-bad")},
 		} {
 			mp, err := createMp(s3client, bucket, obj, withChecksum(test.algo), withChecksumType(types.ChecksumTypeComposite))
 			if err != nil {
@@ -975,29 +983,20 @@ func CompleteMultipartUpload_invalid_final_composite_checksum(s *S3Conf) error {
 			completeParts := make([]types.CompletedPart, 0, len(parts))
 
 			for _, part := range parts {
-				completeParts = append(completeParts, types.CompletedPart{
-					ETag:           part.ETag,
-					PartNumber:     part.PartNumber,
-					ChecksumCRC32:  part.ChecksumCRC32,
-					ChecksumCRC32C: part.ChecksumCRC32C,
-					ChecksumSHA1:   part.ChecksumSHA1,
-					ChecksumSHA256: part.ChecksumSHA256,
-				})
+				completeParts = append(completeParts, completedPartFromPart(part))
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-			_, err = s3client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			input := &s3.CompleteMultipartUploadInput{
 				Bucket:   &bucket,
 				Key:      &obj,
 				UploadId: mp.UploadId,
 				MultipartUpload: &types.CompletedMultipartUpload{
 					Parts: completeParts,
 				},
-				ChecksumCRC32:  test.crc32,
-				ChecksumCRC32C: test.crc32c,
-				ChecksumSHA1:   test.sha1,
-				ChecksumSHA256: test.sha256,
-			})
+			}
+			setCompleteMultipartUploadChecksum(input, test.algo, test.checksum)
+			_, err = s3client.CompleteMultipartUpload(ctx, input)
 			cancel()
 			if err := checkApiErr(err, s3err.GetInvalidChecksumHeaderErr(fmt.Sprintf("x-amz-checksum-%v", strings.ToLower(string(test.algo))))); err != nil {
 				return fmt.Errorf("test %v failed: %w", i, err)
@@ -1090,21 +1089,20 @@ func CompleteMultipartUpload_should_ignore_the_final_checksum(s *S3Conf) error {
 			return err
 		}
 
-		if res.ChecksumCRC32 != nil {
-			return fmt.Errorf("expected nil crc32 checksum, insted got %v",
-				*res.ChecksumCRC32)
-		}
-		if res.ChecksumCRC32C != nil {
-			return fmt.Errorf("expected nil crc32c checksum, insted got %v",
-				*res.ChecksumCRC32C)
-		}
-		if res.ChecksumSHA1 != nil {
-			return fmt.Errorf("expected nil sha1 checksum, insted got %v",
-				*res.ChecksumSHA1)
-		}
-		if res.ChecksumSHA256 != nil {
-			return fmt.Errorf("expected nil sha256 checksum, insted got %v",
-				*res.ChecksumSHA256)
+		for _, algo := range []types.ChecksumAlgorithm{
+			types.ChecksumAlgorithmCrc32,
+			types.ChecksumAlgorithmCrc32c,
+			types.ChecksumAlgorithmSha1,
+			types.ChecksumAlgorithmSha256,
+			types.ChecksumAlgorithmSha512,
+			types.ChecksumAlgorithmMd5,
+			types.ChecksumAlgorithmXxhash64,
+			types.ChecksumAlgorithmXxhash3,
+			types.ChecksumAlgorithmXxhash128,
+		} {
+			if checksum := getCompleteMultipartUploadChecksum(res, algo); checksum != nil {
+				return fmt.Errorf("expected nil %s checksum, insted got %v", algo, *checksum)
+			}
 		}
 		// If no checksum is specified on mp creation, it should default
 		// to crc64nvme
@@ -1907,13 +1905,77 @@ func CompleteMultipartUpload_racey_success(s *S3Conf) error {
 	})
 }
 
+func CompleteMultipartUpload_already_completed(s *S3Conf) error {
+	testName := "CompleteMultipartUpload_already_completed"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		out, err := createMp(s3client, bucket, obj)
+		if err != nil {
+			return err
+		}
+
+		parts, _, err := uploadParts(s3client, 5*1024*1024, 1, bucket, obj, *out.UploadId)
+		if err != nil {
+			return err
+		}
+
+		compParts := []types.CompletedPart{}
+		for _, el := range parts {
+			compParts = append(compParts, types.CompletedPart{
+				ETag:       el.ETag,
+				PartNumber: el.PartNumber,
+			})
+		}
+
+		completeInput := &s3.CompleteMultipartUploadInput{
+			Bucket:   &bucket,
+			Key:      &obj,
+			UploadId: out.UploadId,
+			MultipartUpload: &types.CompletedMultipartUpload{
+				Parts: compParts,
+			},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		first, err := s3client.CompleteMultipartUpload(ctx, completeInput)
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		// Second call with the same upload ID should also succeed (idempotent).
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		second, err := s3client.CompleteMultipartUpload(ctx, completeInput)
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if getString(second.Bucket) != bucket {
+			return fmt.Errorf("expected Bucket to be %s, instead got %s", bucket, getString(second.Bucket))
+		}
+		if getString(second.Key) != obj {
+			return fmt.Errorf("expected Key to be %s, instead got %s", obj, getString(second.Key))
+		}
+		if getString(second.ETag) != getString(first.ETag) {
+			return fmt.Errorf("expected ETag to be %s, instead got %s", getString(first.ETag), getString(second.ETag))
+		}
+		location := constructObjectLocation(s.endpoint, bucket, obj, s.hostStyle)
+		if getString(second.Location) != location {
+			return fmt.Errorf("expected Location to be %s, instead got %s", location, getString(second.Location))
+		}
+
+		return nil
+	})
+}
+
 // CompleteMultipartUpload_racey_data_integrity creates a single multipart
 // upload, uploads its parts, then fires multiple concurrent
-// CompleteMultipartUpload calls for the exact same upload ID.  Exactly one
-// call must succeed; the rest must fail with NoSuchUpload (the upload was
-// already consumed).  The surviving object must contain exactly the data that
-// was uploaded.  The whole sequence is repeated several times so that
-// intermittent scheduling cannot hide a data-corruption bug.
+// CompleteMultipartUpload calls for the exact same upload ID.  All calls must
+// succeed and return the same ETag (idempotent completion).  The surviving
+// object must contain exactly the data that was uploaded.  The whole sequence
+// is repeated several times so that intermittent scheduling cannot hide a
+// data-corruption bug.
 func CompleteMultipartUpload_racey_data_integrity(s *S3Conf) error {
 	testName := "CompleteMultipartUpload_racey_data_integrity"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
@@ -1924,7 +1986,6 @@ func CompleteMultipartUpload_racey_data_integrity(s *S3Conf) error {
 		)
 		obj := "my-obj"
 		objSize := int64(15 * 1024 * 1024) // 3 × 5 MiB parts
-		noSuchUpload := s3err.GetAPIError(s3err.ErrNoSuchUpload)
 
 		for iter := range iterations {
 			// Phase 1: create one upload and upload its parts.
@@ -1938,25 +1999,26 @@ func CompleteMultipartUpload_racey_data_integrity(s *S3Conf) error {
 				return fmt.Errorf("iteration %d: upload parts: %w", iter, err)
 			}
 
+			var partsEtagBytes []byte
 			compParts := make([]types.CompletedPart, 0, len(parts))
 			for _, el := range parts {
+				b, err := getEtagBytes(*el.ETag)
+				if err != nil {
+					return fmt.Errorf("iteration %d: %w", iter, err)
+				}
+				partsEtagBytes = append(partsEtagBytes, b...)
 				compParts = append(compParts, types.CompletedPart{
 					ETag:       el.ETag,
 					PartNumber: el.PartNumber,
 				})
 			}
+			expectedETag := fmt.Sprintf("\"%s-%d\"", md5String(partsEtagBytes), len(parts))
 
-			// Phase 2: race concurrency complete calls for the same upload ID.
-			// Exactly one must succeed; the others must return NoSuchUpload.
-			var (
-				mu         sync.Mutex
-				successCnt int
-			)
 			eg := errgroup.Group{}
 			for range concurrency {
 				eg.Go(func() error {
 					ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-					_, err := s3client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+					res, err := s3client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 						Bucket:   &bucket,
 						Key:      &obj,
 						UploadId: out.UploadId,
@@ -1965,22 +2027,19 @@ func CompleteMultipartUpload_racey_data_integrity(s *S3Conf) error {
 						},
 					})
 					cancel()
-					if err == nil {
-						mu.Lock()
-						successCnt++
-						mu.Unlock()
-						return nil
+					if err != nil {
+						return err
 					}
-					// Every non-zero error must be NoSuchUpload.
-					return checkApiErr(err, noSuchUpload)
+
+					if getString(res.ETag) != expectedETag {
+						return fmt.Errorf("expected the multipart upload ETag to be %s, instead got %s", expectedETag, getString(res.ETag))
+					}
+
+					return nil
 				})
 			}
 			if err := eg.Wait(); err != nil {
 				return fmt.Errorf("iteration %d: complete phase: %w", iter, err)
-			}
-			if successCnt != 1 {
-				return fmt.Errorf("iteration %d: expected exactly 1 successful complete, got %d",
-					iter, successCnt)
 			}
 
 			// Phase 3: download the object and verify it is complete and
